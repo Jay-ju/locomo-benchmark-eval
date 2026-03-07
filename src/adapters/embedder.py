@@ -12,6 +12,7 @@ pipelines and tests can run without any external API key.
 
 import logging
 import os
+import json
 import random
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Sequence
@@ -85,6 +86,16 @@ class OpenAICompatibleEmbedder(EmbedderAdapter):
         self._dimensions = int(config.dimensions)
         self._rng = random.Random(rng_seed)
 
+        # Try to detect if the base_url is a full endpoint URL (e.g. Doubao specific)
+        self._is_custom_endpoint = False
+        if config.base_url:
+            # Simple heuristic: if it ends with "embeddings" or "embeddings/multimodal", it's likely a full endpoint
+            # Standard OpenAI base_url usually ends with /v1
+            lower_url = config.base_url.lower()
+            if lower_url.endswith("/embeddings") or "embeddings/" in lower_url:
+                self._is_custom_endpoint = True
+                logger.info("Detected custom embedding endpoint: %s", config.base_url)
+
         self._client = None
         if not config.dry_run:
             # Lazily import to keep the package importable even if
@@ -99,7 +110,20 @@ class OpenAICompatibleEmbedder(EmbedderAdapter):
 
             client_kwargs = {"api_key": api_key}
             if config.base_url:
-                client_kwargs["base_url"] = config.base_url
+                if self._is_custom_endpoint:
+                    # For OpenAI client, base_url is usually the root.
+                    # If we have a full path, we might need to handle it manually or trick the client.
+                    # However, standard OpenAI client appends /embeddings to base_url.
+                    # If the user provided ".../embeddings/multimodal", appending /embeddings -> ".../embeddings/multimodal/embeddings" (Wrong)
+                    # So if it's a custom endpoint, we might prefer using httpx directly in _embed_many
+                    # But to initialize the client, we can just pass the base_url as is for now,
+                    # or pass a dummy one if we are going to bypass it.
+                    # Let's keep the client for potential future use or non-embedding calls,
+                    # but _embed_many will handle the custom logic.
+                    client_kwargs["base_url"] = config.base_url
+                else:
+                    client_kwargs["base_url"] = config.base_url
+            
             self._client = OpenAI(**client_kwargs)
 
     # ------------------------------------------------------------------
@@ -140,22 +164,114 @@ class OpenAICompatibleEmbedder(EmbedderAdapter):
         if not texts_list:
             return []
 
-        if self._config.dry_run or self._client is None:
+        if self._config.dry_run:
             # Deterministic pseudo-random vectors for reproducible tests.
             return [self._random_vector() for _ in texts_list]
+
+        # Special handling for Doubao Vision models on custom endpoints (no batch support)
+        if self._is_custom_endpoint and self._config.base_url and "vision" in self._config.model:
+             import httpx
+             headers = {
+                 "Content-Type": "application/json",
+                 "Authorization": f"Bearer {self._config.api_key or os.getenv('OPENAI_API_KEY')}",
+             }
+             vectors = []
+             with httpx.Client(timeout=60.0) as http_client:
+                 for text in texts_list:
+                     payload = {
+                         "model": self._config.model,
+                         "input": [{"type": "text", "text": text}],
+                     }
+                     if task:
+                         payload["task"] = task
+                     
+                     try:
+                         # print(f"[DEBUG] Sending payload to {self._config.base_url}: {json.dumps(payload)}")
+                         resp = http_client.post(self._config.base_url, json=payload, headers=headers)
+                         resp.raise_for_status()
+                         data = resp.json()
+                         
+                         # data['data'] is expected to be a dict with 'embedding' key for single item
+                         emb = None
+                         d_data = data.get("data")
+                         if isinstance(d_data, dict):
+                             emb = d_data.get("embedding")
+                         elif isinstance(d_data, list) and len(d_data) > 0:
+                             emb = d_data[0].get("embedding")
+                             
+                         if not emb:
+                             print(f"[ERROR] Unexpected response format: {data}")
+                             raise RuntimeError("No embedding found in response")
+                                 
+                         vectors.append(emb)
+                     except Exception as exc:
+                         print(f"[ERROR] Failed to embed text: {exc}")
+                         if isinstance(exc, httpx.HTTPStatusError):
+                             print(f"[ERROR] Response text: {exc.response.text}")
+                         raise
+             return vectors
 
         payload: dict = {
             "model": self._config.model,
             "input": texts_list,
-            "encoding_format": "float",
         }
+        
+        # Only add encoding_format if not custom endpoint or known to support it
+        if not self._is_custom_endpoint:
+            payload["encoding_format"] = "float"
+        elif "vision" in self._config.model:
+             # Hypothesis: Doubao vision model expects structured input
+             payload["input"] = [{"type": "text", "text": t} for t in texts_list]
+
         if task:
             payload["task"] = task
-        if self._dimensions:
+            
+        # Some providers (like Doubao/Volcengine) do not support 'dimensions' parameter
+        # Only add it if we are sure, or if it's OpenAI
+        if self._dimensions and not self._is_custom_endpoint:
             payload["dimensions"] = self._dimensions
 
         try:
-            response = self._client.embeddings.create(**payload)  # type: ignore[operator]
+            if self._is_custom_endpoint and self._config.base_url:
+                # Direct HTTP call for custom endpoints (e.g. Doubao) to avoid OpenAI client path appending logic
+                import httpx
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._config.api_key or os.getenv('OPENAI_API_KEY')}",
+                }
+                
+                # Use a new client or the one from openai if exposed (it's not easily exposed)
+                # Just use httpx.post
+                with httpx.Client(timeout=60.0) as http_client:
+                    try:
+                        print(f"[DEBUG] Sending payload to {self._config.base_url}: {json.dumps(payload)}")
+                        resp = http_client.post(self._config.base_url, json=payload, headers=headers)
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        print(f"[ERROR] HTTPStatusError: {exc}")
+                        print(f"[ERROR] Response text: {exc.response.text}")
+                        raise
+
+                    # Mocking an object that looks like OpenAI response for downstream compatibility
+                    data = resp.json()
+                    
+                    # Wrap in a simple structure to match the loop below
+                    class MockItem:
+                        def __init__(self, d):
+                            self.embedding = d.get("embedding")
+                            self.index = d.get("index")
+                            
+                    class MockResponse:
+                        def __init__(self, d):
+                            self.data = [MockItem(i) for i in d.get("data", [])]
+                            
+                    response = MockResponse(data)
+            else:
+                if self._client is None:
+                     # Deterministic pseudo-random vectors for reproducible tests.
+                    return [self._random_vector() for _ in texts_list]
+                response = self._client.embeddings.create(**payload)  # type: ignore[operator]
         except Exception as exc:  # pragma: no cover - network path
             logger.error("Failed to call embedding provider: %s", exc)
             raise

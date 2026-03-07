@@ -1,0 +1,4 @@
+What is the user's name and profession?
+Where is the user planning to travel?
+What food does the user like?
+When is the user's birthday?

@@ -1,0 +1,22 @@
+[
+    {
+        "question": "What is the user's name and profession?",
+        "ground_truth": "The user's name is Alex and he is a software engineer."
+    },
+    {
+        "question": "Where is the user planning to travel?",
+        "ground_truth": "The user is planning to travel to Japan, specifically visiting Tokyo and Kyoto."
+    },
+    {
+        "question": "What food does the user like?",
+        "ground_truth": "The user likes sushi and ramen."
+    },
+    {
+        "question": "When is the user's birthday?",
+        "ground_truth": "The user's birthday is on October 15th."
+    },
+    {
+        "question": "What hobby does the user mention regarding cameras?",
+        "ground_truth": "The user collects old film cameras and wants to buy vintage cameras in Japan."
+    }
+]

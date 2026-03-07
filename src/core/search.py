@@ -24,8 +24,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
-from .embedder import EmbedderAdapter
-from .vector_store import VectorStoreAdapter
+from .udfs import SearchUDF
+from ..adapters.embedder import EmbedderAdapter, OpenAICompatibleEmbedder
+from .models import StoredMemoryEntry
+from ..adapters.vector_store import VectorStoreAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -139,27 +141,49 @@ class SearchRunner:
             from daft import DataType, col  # type: ignore
         except Exception as exc:  # pragma: no cover - optional dependency
             raise RuntimeError(
-                "SearchRunner.search_batch 需要 daft 库，请安装 daft 并重试。",
+                "SearchRunner.search_batch requires 'daft' library. Please install it and try again.",
             ) from exc
 
         df = daft.from_pydict({"payload": indexed})
 
-        def _apply(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-            query_text = (payload.get("query") or "").strip()
-            if not query_text:
-                return []
-            try:
-                vec = self.embedder.embed_query(query_text)
-                raw = self.store.vector_search(vec, top_k=top_k, min_score=min_score)
-                return [self._normalize_result(r) for r in raw]
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("search_batch: failed for query=%r: %s", query_text, exc)
-                return []
-
+        # Prepare config for UDF
+        embed_config_json = "{}"
+        if hasattr(self.embedder, "_config"):
+             # Assuming OpenAICompatibleEmbedder
+             import dataclasses, json
+             # We need to serialize the dataclass. asdict might work if fields are simple.
+             try:
+                 cfg = dataclasses.asdict(self.embedder._config)
+                 embed_config_json = json.dumps(cfg)
+             except Exception as e:
+                 logger.warning("Failed to serialize embedder config: %s", e)
+        
+        store_config_json = "{}"
+        if hasattr(self.store, "config") and self.store.config:
+             import dataclasses, json
+             try:
+                 cfg = dataclasses.asdict(self.store.config)
+                 # Add path if not in config
+                 if hasattr(self.store, "_db_path"):
+                     cfg["db_path"] = str(self.store._db_path)
+                 if hasattr(self.store, "_table_name"):
+                     cfg["table_name"] = self.store._table_name
+                 store_config_json = json.dumps(cfg)
+             except Exception as e:
+                 logger.warning("Failed to serialize store config: %s", e)
+        
+        # Apply SearchUDF (Class UDF)
         df_with = df.with_column(
             "results",
-            col("payload").apply(_apply, return_dtype=DataType.python()),
+            SearchUDF.with_init_args(
+                embed_config_json=embed_config_json,
+                store_config_json=store_config_json,
+                top_k=top_k,
+                min_score=min_score,
+                mode=self.mode
+            )(col("payload"))
         )
+        
         collected = df_with.collect().to_pydict()
 
         payload_col = collected.get("payload", [])

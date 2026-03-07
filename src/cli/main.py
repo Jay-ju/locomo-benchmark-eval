@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Typer-based CLI for the add_lance_memory tool.
+"""Typer-based CLI for the locomo_eval tool.
 
 Example usage (dry-run, no API key required)::
 
-    python -m openclaw_mem_import.cli direct-import \
-        openclaw-eval/data/viking/user/memories \
+    python -m locomo_eval.cli add \
+        data/locomo/locomo10.json \
         --store-type lancedb \
         --db-path ./tmp_lancedb \
         --vector-dim 64 \
@@ -14,26 +14,30 @@ Example usage (dry-run, no API key required)::
 After installing this package with ``pip install -e .``, the same
 command is available as a console script::
 
-    add_lance_memory direct-import ...
+    locomo_eval add ...
 """
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional
 
 import typer
+from dotenv import load_dotenv
 
-from .daft_prompt import DaftPromptRunner
-from .distill_prompts import SESSION_DISTILL_PROMPT_ZH
-from .embedder import (
+# Try to load .env file from current directory
+load_dotenv()
+
+from ..core.daft_runner import DaftPromptRunner
+from ..adapters.embedder import (
     OpenAICompatibleConfig,
     OpenAICompatibleEmbedder,
     RandomEmbedder,
 )
-from .pipeline import ImportPipeline, PipelineConfig
-from .search import SearchRunner
-from .vector_store import create_vector_store
+from ..core.pipeline import ImportPipeline, PipelineConfig
+from ..core.search import SearchRunner
+from ..adapters.vector_store import create_vector_store
 
 app = typer.Typer(help="Import OpenClaw-style memories into configurable vector stores.")
 
@@ -41,16 +45,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 _SUPPORTED_STORE_TYPES = ("lancedb", "faiss", "milvus", "viking")
 
-# 简单的 QA system prompt，用于在检索上下文基础上回答问题。
-_QA_SYSTEM_PROMPT_ZH = (
-    "你是一个长期记忆评测用的问答助手。" "你将收到用户问题，以及若干与问题相关的记忆片段。" "\n\n"
-    "原则：\n"
-    "1. 只能基于提供的记忆内容回答问题，不要编造事实；\n"
-    "2. 如果记忆不足以回答，请明确回答：‘我在当前记忆中找不到足够的信息来回答这个问题。’；\n"
-    "3. 回答尽量简洁、直接，不重复整段记忆文本；\n"
-    "4. 如有时间信息，请注意时间顺序与相对时间表达（昨天/上周等）。"
-)
-
+from ..core.prompts.qa import QA_SYSTEM_PROMPT
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,10 +58,10 @@ def _normalize_store_type(store_type: str) -> str:
         allowed = " | ".join(_SUPPORTED_STORE_TYPES)
         raise typer.BadParameter(f"Unsupported store-type '{store_type}'. Expected one of: {allowed}.")
     if normalized != "lancedb":
-        # 当前版本中只有 LanceDB 有可用实现，其它类型作为占位符提前提示。
+        # Only LanceDB has a working implementation in this version.
         typer.echo(
-            f"[warning] store_type='{normalized}' 适配器尚未在此示例中实现, "
-            "运行时会抛出 NotImplementedError。",
+            f"[warning] store_type='{normalized}' adapter is not implemented in this example yet, "
+            "it will raise NotImplementedError at runtime.",
             err=True,
         )
     return normalized
@@ -112,12 +107,12 @@ def _create_search_runner(
 
 
 # ---------------------------------------------------------------------------
-# direct-import
+# add (formerly direct-import)
 # ---------------------------------------------------------------------------
 
 
-@app.command("direct-import")
-def direct_import(
+@app.command("add")
+def add(
     input_paths: List[Path] = typer.Argument(
         ..., help="Input files or directories. Supports Markdown / JSONL / LoCoMo JSON.",
     ),
@@ -142,23 +137,26 @@ def direct_import(
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
+        envvar="VECTOR_DIM",
         help="Embedding vector dimension. Must match the embedding model / provider.",
     ),
     base_url: Optional[str] = typer.Option(
         None,
         "--base-url",
+        envvar="EMBEDDING_BASE_URL",
         help="OpenAI-compatible embeddings base URL (e.g. https://api.openai.com/v1).",
     ),
     model: str = typer.Option(
         "text-embedding-3-small",
         "--model",
+        envvar="EMBEDDING_MODEL",
         help="Embedding model name for the provider.",
     ),
     api_key: Optional[str] = typer.Option(
         None,
         "--api-key",
-        envvar="OPENAI_API_KEY",
-        help="Embedding API key. Can also come from OPENAI_API_KEY environment variable.",
+        envvar="EMBEDDING_API_KEY",
+        help="Embedding API key. Can also come from EMBEDDING_API_KEY environment variable.",
     ),
     task_query: Optional[str] = typer.Option(
         None,
@@ -250,8 +248,8 @@ def direct_import(
 # ---------------------------------------------------------------------------
 
 
-@app.command("session-distill")
-def session_distill(
+@app.command("ingest")
+def ingest(
     input_paths: List[Path] = typer.Argument(
         ..., help="Session transcripts or long text files to distill from.",
     ),
@@ -276,20 +274,23 @@ def session_distill(
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
+        envvar="VECTOR_DIM",
         help="Embedding vector dimension. Must match the embedding model / provider.",
     ),
     # OpenAI-compatible parameters for the *distillation LLM*.
     base_url: str = typer.Option(
         "https://api.openai.com/v1",
         "--base-url",
+        envvar="OPENAI_BASE_URL",
         help=(
             "OpenAI-compatible chat/responses base URL for distillation LLM "
-            "(e.g. https://api.openai.com/v1 或 OpenClaw Gateway /v1)."
+            "(e.g. https://api.openai.com/v1 or OpenClaw Gateway)."
         ),
     ),
     model: str = typer.Option(
         "gpt-4o-mini",
         "--model",
+        envvar="OPENAI_MODEL",
         help="LLM model name used for session distillation (e.g. gpt-4o-mini, openclaw, etc).",
     ),
     api_key: Optional[str] = typer.Option(
@@ -305,11 +306,13 @@ def session_distill(
     embed_base_url: Optional[str] = typer.Option(
         None,
         "--embed-base-url",
+        envvar="EMBEDDING_BASE_URL",
         help="Optional OpenAI-compatible base URL for embeddings (defaults to --base-url if omitted).",
     ),
     embed_model: str = typer.Option(
         "text-embedding-3-small",
         "--embed-model",
+        envvar="EMBEDDING_MODEL",
         help="Embedding model name used when writing distilled memories into the vector store.",
     ),
     embed_api_key: Optional[str] = typer.Option(
@@ -342,29 +345,20 @@ def session_distill(
         ),
     ),
 ) -> None:
-    """Run Daft-based session distillation and write memories into a vector store.
+    """Ingest memories from session logs (session distillation).
 
-    Flow:
-
-    1. 构造 :class:`DaftPromptRunner`，对每个输入文件执行中文会话蒸馏 Prompt；
-    2. 收集所有 JSON 记忆条目；
-    3. 通过 ``create_vector_store(...)`` 创建向量库适配器；
-    4. 通过 ``RandomEmbedder``（dry-run）或 ``OpenAICompatibleEmbedder`` 生成向量；
-    5. 调用 ``runner.store_to_vector(...)`` 批量写入。
-
-    当 ``dry_run=True`` 时仍然会使用 Daft 做并行 map，但每个文件只生成一条
-    示例记忆，不会访问任何网络。这样可以在本地快速验证端到端流程。
+    This command (formerly session-distill) uses an LLM to extract atomic memories from conversation logs
+    and stores them in the vector database.
     """
 
     store_type_normalized = _normalize_store_type(store_type)
 
     if not dry_run and not api_key:
-        raise typer.BadParameter("session-distill 在非 dry-run 模式下需要提供 --api-key 或设置 OPENAI_API_KEY。")
+        raise typer.BadParameter("ingest requires --api-key or OPENAI_API_KEY in non-dry-run mode.")
 
-    # 1) 构造 DaftPromptRunner（会在缺少 daft/openai 时抛出带中文提示的异常）。
+    # 1) Construct DaftPromptRunner (will raise exception with prompt if daft/openai missing).
     try:
         runner = DaftPromptRunner(
-            prompt=SESSION_DISTILL_PROMPT_ZH,
             openai_base_url=base_url,
             openai_api_key=api_key,
             model=model,
@@ -377,13 +371,13 @@ def session_distill(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
 
-    # 2) 执行蒸馏（每个文件 → 若干 JSON 记忆条目）。
+    # 2) Execute distillation (each file -> multiple JSON memory entries).
     entries = runner.run([str(p) for p in input_paths])
     if not entries:
-        typer.echo("session-distill: 未从输入文件中得到任何记忆条目，结束。")
+        typer.echo("ingest: No memory entries obtained from input files, ending.")
         raise typer.Exit(code=0)
 
-    # 3) 创建向量库适配器。
+    # 3) Create vector store adapter.
     store = create_vector_store(
         store_type=store_type_normalized,
         db_path=str(db_path),
@@ -391,7 +385,7 @@ def session_distill(
         vector_dim=vector_dim,
     )
 
-    # 4) 创建嵌入适配器：dry-run 使用 RandomEmbedder，其它情况使用 OpenAI-compatible Embeddings。
+    # 4) Create embedding adapter: dry-run uses RandomEmbedder, others use OpenAI-compatible Embeddings.
     if dry_run:
         embedder = RandomEmbedder(dimensions=vector_dim)
     else:
@@ -406,16 +400,16 @@ def session_distill(
         )
         embedder = OpenAICompatibleEmbedder(embed_cfg)
 
-    # 5) 写入向量库。
+    # 5) Write to vector store.
     inserted = runner.store_to_vector(store, embedder, entries)
 
     if store_type_normalized == "lancedb":
         typer.echo(
-            f"Session distill imported {inserted} memories into LanceDB at {db_path} (table={table_name}).",
+            f"Ingest completed: {inserted} memories imported into LanceDB at {db_path} (table={table_name}).",
         )
     else:
         typer.echo(
-            f"Session distill imported {inserted} memories into vector store (type={store_type_normalized}).",
+            f"Ingest completed: {inserted} memories imported into vector store (type={store_type_normalized}).",
         )
 
 
@@ -451,16 +445,19 @@ def search(
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
+        envvar="VECTOR_DIM",
         help="Embedding vector dimension. Must match the embedding model / provider.",
     ),
     embed_base_url: Optional[str] = typer.Option(
         None,
         "--embed-base-url",
+        envvar="EMBEDDING_BASE_URL",
         help="OpenAI-compatible embeddings base URL (e.g. https://api.openai.com/v1).",
     ),
     embed_model: str = typer.Option(
         "text-embedding-3-small",
         "--embed-model",
+        envvar="EMBEDDING_MODEL",
         help="Embedding model name for the provider.",
     ),
     embed_api_key: Optional[str] = typer.Option(
@@ -498,13 +495,13 @@ def search(
 ) -> None:
     """Search memories using vector similarity.
 
-    - 默认执行单条查询（``query`` 位置参数）。
-    - 当提供 ``--input-file`` 时，按行批量查询，并使用 Daft 做并行。"""
+    - Defaults to single query execution (``query`` positional argument).
+    - When ``--input-file`` is provided, runs batch search line by line, using Daft for parallelism."""
 
     if input_file is None and (query is None or not str(query).strip()):
-        raise typer.BadParameter("search 需要提供 query 参数或 --input-file 其一。")
+        raise typer.BadParameter("search requires a query argument or --input-file.")
 
-    # 读取查询集合
+    # Read query set
     queries: List[str] = []
     is_batch = input_file is not None
 
@@ -512,13 +509,13 @@ def search(
         try:
             text = input_file.read_text(encoding="utf-8")
         except Exception as exc:  # pragma: no cover - IO path
-            raise typer.BadParameter(f"无法读取 --input-file: {exc}") from exc
+            raise typer.BadParameter(f"Cannot read --input-file: {exc}") from exc
         for line in text.splitlines():
             line = line.strip()
             if line:
                 queries.append(line)
         if not queries:
-            typer.echo("search: 输入文件中没有有效的查询行。")
+            typer.echo("search: No valid query lines in input file.")
             raise typer.Exit(code=0)
     else:
         assert query is not None
@@ -581,16 +578,19 @@ def search_batch(
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
+        envvar="VECTOR_DIM",
         help="Embedding vector dimension. Must match the embedding model / provider.",
     ),
     embed_base_url: Optional[str] = typer.Option(
         None,
         "--embed-base-url",
+        envvar="EMBEDDING_BASE_URL",
         help="OpenAI-compatible embeddings base URL (e.g. https://api.openai.com/v1).",
     ),
     embed_model: str = typer.Option(
         "text-embedding-3-small",
         "--embed-model",
+        envvar="EMBEDDING_MODEL",
         help="Embedding model name for the provider.",
     ),
     embed_api_key: Optional[str] = typer.Option(
@@ -623,12 +623,12 @@ def search_batch(
 ) -> None:
     """Batch search wrapper around :func:`search`.
 
-    行为等价于 ``search --input-file <queries_file>``，保持接口语义清晰。"""
+    Equivalent to ``search --input-file <queries_file>``, keeping the interface semantic clear."""
 
     try:
         text = queries_file.read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - IO path
-        raise typer.BadParameter(f"无法读取 queries_file: {exc}") from exc
+        raise typer.BadParameter(f"Cannot read queries_file: {exc}") from exc
 
     queries: List[str] = []
     for line in text.splitlines():
@@ -637,7 +637,7 @@ def search_batch(
             queries.append(line)
 
     if not queries:
-        typer.echo("search-batch: 输入文件中没有有效的查询行。")
+        typer.echo("search-batch: No valid query lines in input file.")
         raise typer.Exit(code=0)
 
     runner, store_type_normalized = _create_search_runner(
@@ -675,8 +675,8 @@ def search_batch(
 # ---------------------------------------------------------------------------
 
 
-@app.command("qa")
-def qa(
+@app.command("eval")
+def eval(
     queries_file: Path = typer.Argument(
         ..., help="Text file with one question per line (LoCoMo-style queries).",
     ),
@@ -702,16 +702,19 @@ def qa(
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
+        envvar="VECTOR_DIM",
         help="Embedding vector dimension. Must match the embedding model / provider.",
     ),
     embed_base_url: Optional[str] = typer.Option(
         None,
         "--embed-base-url",
+        envvar="EMBEDDING_BASE_URL",
         help="OpenAI-compatible embeddings base URL for retrieval embeddings.",
     ),
     embed_model: str = typer.Option(
         "text-embedding-3-small",
         "--embed-model",
+        envvar="EMBEDDING_MODEL",
         help="Embedding model name used for retrieval.",
     ),
     embed_api_key: Optional[str] = typer.Option(
@@ -730,11 +733,13 @@ def qa(
     base_url: str = typer.Option(
         "https://api.openai.com/v1",
         "--base-url",
+        envvar="OPENAI_BASE_URL",
         help="OpenAI-compatible chat base URL for QA answering.",
     ),
     model: str = typer.Option(
         "gpt-4o-mini",
         "--model",
+        envvar="OPENAI_MODEL",
         help="LLM model name used for answering (e.g. gpt-4o-mini).",
     ),
     api_key: Optional[str] = typer.Option(
@@ -769,9 +774,14 @@ def qa(
         help="Optional output JSON file. Defaults to stdout.",
     ),
 ) -> None:
-    """End-to-end QA: retrieve memories then answer via DaftPromptRunner.
+    """Evaluate QA performance: retrieve memories then answer via DaftPromptRunner.
 
-    输出为 JSON 数组，每个元素形如::
+    This command (formerly qa) runs an end-to-end evaluation:
+    1. Retrieves relevant memories for each question in the input file.
+    2. Uses an LLM to generate an answer based on the retrieved context.
+    3. Outputs the result (question, answer, context, context_ids).
+
+    Output is a JSON array, where each element looks like::
 
         {
           "question": "...",
@@ -780,11 +790,11 @@ def qa(
         }
     """
 
-    # 读取问题
+    # Read questions
     try:
         text = queries_file.read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - IO path
-        raise typer.BadParameter(f"无法读取 queries_file: {exc}") from exc
+        raise typer.BadParameter(f"Cannot read queries_file: {exc}") from exc
 
     questions: List[str] = []
     for line in text.splitlines():
@@ -793,10 +803,10 @@ def qa(
             questions.append(line)
 
     if not questions:
-        typer.echo("qa: 输入文件中没有有效的问题行。")
+        typer.echo("eval: No valid question lines in input file.")
         raise typer.Exit(code=0)
 
-    # 1) 检索阶段：使用 SearchRunner + Daft（批量）获取 context
+    # 1) Retrieval phase: Use SearchRunner + Daft (batch) to get context
     search_runner, store_type_normalized = _create_search_runner(
         store_type=store_type,
         db_path=db_path,
@@ -817,7 +827,7 @@ def qa(
 
     qa_items: List[dict] = []
     for q, results in zip(questions, search_results):
-        # 拼装上下文文本
+        # Assemble context text
         lines: List[str] = []
         context_ids: List[str] = []
         for idx, r in enumerate(results):
@@ -841,13 +851,13 @@ def qa(
             },
         )
 
-    # 2) 回答阶段：DaftPromptRunner.answer_batch
+    # 2) Answering phase: DaftPromptRunner.answer_batch
     if not dry_run and not api_key:
-        raise typer.BadParameter("qa 在非 dry-run 模式下需要提供 --api-key 或设置 OPENAI_API_KEY。")
+        raise typer.BadParameter("eval requires --api-key or OPENAI_API_KEY in non-dry-run mode.")
 
     try:
         qa_runner = DaftPromptRunner(
-            prompt=_QA_SYSTEM_PROMPT_ZH,
+            prompt=QA_SYSTEM_PROMPT,
             openai_base_url=base_url,
             openai_api_key=api_key,
             model=model,
@@ -867,6 +877,97 @@ def qa(
         output.write_text(json_str, encoding="utf-8")
     else:
         typer.echo(json_str)
+
+
+@app.command("judge")
+def judge(
+    results_file: Path = typer.Argument(
+        ..., help="JSON file containing QA results (question, answer, optional ground_truth).",
+    ),
+    # LLM options for judging
+    base_url: str = typer.Option(
+        "https://api.openai.com/v1",
+        "--base-url",
+        envvar="OPENAI_BASE_URL",
+        help="OpenAI-compatible chat base URL for judging.",
+    ),
+    model: str = typer.Option(
+        "gpt-4o-mini",
+        "--model",
+        envvar="OPENAI_MODEL",
+        help="LLM model name used for judging (e.g. gpt-4o).",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None,
+        "--api-key",
+        envvar="OPENAI_API_KEY",
+        help="LLM API key for judging. If omitted, falls back to OPENAI_API_KEY.",
+    ),
+    parallelism: int = typer.Option(
+        4,
+        "--parallelism",
+        help="Logical parallelism hint used by Daft for per-question judging.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Use Daft but return fixed dry-run scores without calling any remote LLM.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Optional output JSON file. Defaults to overwriting the input file if not provided.",
+    ),
+) -> None:
+    """Evaluate QA results using LLM-as-a-Judge.
+
+    Input file should be a JSON array of objects with "question" and "answer" fields.
+    Output will add a "judge_result" field to each object:
+      "judge_result": { "score": 1-5, "reasoning": "..." }
+    """
+    
+    try:
+        text = results_file.read_text(encoding="utf-8")
+        qa_results = json.loads(text)
+    except Exception as exc:
+        raise typer.BadParameter(f"Cannot read results_file: {exc}") from exc
+    
+    if not isinstance(qa_results, list):
+        raise typer.BadParameter("Input file must contain a JSON array.")
+
+    if not dry_run and not api_key:
+        raise typer.BadParameter("judge requires --api-key or OPENAI_API_KEY in non-dry-run mode.")
+
+    try:
+        runner = DaftPromptRunner(
+            openai_base_url=base_url,
+            openai_api_key=api_key,
+            model=model,
+            parallelism=parallelism,
+            dry_run=dry_run,
+        )
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1)
+
+    judged_results = runner.judge_batch(qa_results)
+    
+    # Calculate average score
+    scores = []
+    for item in judged_results:
+        res = item.get("judge_result", {})
+        if isinstance(res, dict):
+            s = res.get("score")
+            if isinstance(s, (int, float)):
+                scores.append(s)
+    
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    typer.echo(f"Judge completed. Average Score: {avg_score:.2f} / 5.0")
+
+    json_str = json.dumps(judged_results, ensure_ascii=False, indent=2)
+    target_path = output or results_file
+    target_path.write_text(json_str, encoding="utf-8")
+    typer.echo(f"Results saved to {target_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

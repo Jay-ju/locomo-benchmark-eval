@@ -11,3 +11,16 @@ dist/
 
 # Python packaging metadata
 *.egg-info/
+
+# Environment variables
+.env
+.env.*
+
+# Output directories
+output/
+
+# Logs
+*.log
+
+# Temporary test scripts
+test_*.py

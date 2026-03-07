@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-from .embedder import EmbedderAdapter
+from ..adapters.embedder import EmbedderAdapter
 from .models import MemoryEntryPayload, StoredMemoryEntry
-from .vector_store import VectorStoreAdapter
+from ..adapters.vector_store import VectorStoreAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -349,18 +349,18 @@ class ImportPipeline:
                 continue
 
             text_parts = [
-                f"LoCoMo 记录 {record_id} 中，类别 {category_raw} 的第 {q_index} 题评测结果。",
+                f"LoCoMo record {record_id}, category {category_raw}, question {q_index} evaluation result.",
             ]
             if question:
-                text_parts.append(f"问题：{question}")
+                text_parts.append(f"Question: {question}")
             if ground_truth:
-                text_parts.append(f"标准答案：{ground_truth}")
+                text_parts.append(f"Ground Truth: {ground_truth}")
             if score is not None:
-                text_parts.append(f"MemoryLake 在该题的 F1 得分约为 {score}。")
+                text_parts.append(f"MemoryLake F1 score for this question is approximately {score}.")
 
             text = " ".join(text_parts)
 
-            keywords_line = f"Keywords (zh): LoCoMo; {record_id}; {category_raw}; 记忆评测; F1; MemoryLake"
+            keywords_line = f"Keywords: LoCoMo; {record_id}; {category_raw}; evaluation; F1; MemoryLake"
 
             metadata = {
                 "source": "locomo_result",
@@ -369,7 +369,7 @@ class ImportPipeline:
                 "question_index": q_index,
                 "category_raw": category_raw,
                 "score": score,
-                "keywords_zh_line": keywords_line,
+                "keywords_line": keywords_line,
             }
 
             payloads.append(
