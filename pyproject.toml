@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-mem-import"
+version = "0.1.0"
+description = "Generic LanceDB memory import CLI for OpenClaw-style long-term memory, with pluggable embedders and vector stores."
+readme = "README.md"
+authors = [{ name = "openclaw-mem-import", email = "dev@example.com" }]
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "daft[dataframe]>=0.3.0",
+  "lancedb>=0.7.0",
+  "typer[all]>=0.9.0",
+  "pydantic>=2.6.0",
+  "openai>=1.6.0",
+]
+
+[project.scripts]
+add_lance_memory = "openclaw_mem_import.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openclaw_mem_import*"]

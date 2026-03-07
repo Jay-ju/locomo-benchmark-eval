@@ -1,0 +1,13 @@
+# Local LanceDB test data
+tmp_lancedb/
+
+# Python cache and virtualenvs
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+dist/
+
+# Python packaging metadata
+*.egg-info/
