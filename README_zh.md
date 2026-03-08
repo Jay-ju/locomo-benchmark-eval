@@ -46,6 +46,53 @@ python -m src.cli.main eval \
   --output qa_results.json
 ```
 
+##### 使用 Doubao (Volcengine/Ark) 作为蒸馏与评测 LLM
+
+- 使用 LiteLLM 的 Doubao 原生集成时：
+  - 聊天模型名形如：`volcengine/<YOUR_ENDPOINT_ID>`。
+  - 鉴权优先从 `VOLCENGINE_API_KEY` 或 `ARK_API_KEY` 环境变量读取（也可以显式传入 `--api-key`）。
+  - 本项目内部不会为 Doubao 传递 `base_url`，因此 **不需要** 在命令行中显式设置 `--base-url`，保持默认即可；即使传入，Doubao 路径也会被忽略。
+
+- 如果通过 Doubao 的 OpenAI-Compatible 网关调用：
+  - 模型名需要加前缀：`openai/<your-model-name>`。
+  - `--base-url` 必须是形如 `https://your-gateway-host/v1` 的根路径，**不要额外拼接** `/chat/completions` 等子路径。
+  - API 密钥建议放在 `OPENAI_API_KEY` 环境变量中。
+
+示例（使用 Doubao 做蒸馏 + 评测，dry-run 时无需任何密钥）：
+
+```bash
+# 蒸馏（ingest），使用 Doubao Endpoint ID（原生 Provider）
+export VOLCENGINE_API_KEY="YOUR_DOUBAO_KEY"
+
+python -m src.cli.main ingest \
+  ./data/chat_logs/sample_chat.txt \
+  --db-path ./tmp_lancedb_eval \
+  --model volcengine/<YOUR_ENDPOINT_ID>
+
+# 评测（eval），复用同一模型
+python -m src.cli.main eval \
+  ./data/questions.txt \
+  --db-path ./tmp_lancedb_eval \
+  --model volcengine/<YOUR_ENDPOINT_ID>
+```
+
+```bash
+# 通过 OpenAI-Compatible 网关调用 Doubao
+export OPENAI_API_KEY="YOUR_PROXY_KEY"
+
+python -m src.cli.main ingest \
+  ./data/chat_logs/sample_chat.txt \
+  --db-path ./tmp_lancedb_eval \
+  --model openai/<YOUR_MODEL_NAME> \
+  --base-url https://your-gateway-host/v1
+```
+
+常见错误与排查：
+
+- **模型前缀错误**：例如在 Doubao 原生模式下使用 `gpt-4o` 或缺少 `volcengine/` 前缀，或在 OpenAI-Compatible 模式下忘记加 `openai/` 前缀。
+- **base_url 缺少 `/v1`**：对于 OpenAI-Compatible 网关，`--base-url` 未以 `/v1` 结尾时，常见报错为 `Not Found` 或 404。
+- **密钥未设置**：`VOLCENGINE_API_KEY` / `ARK_API_KEY` / `OPENAI_API_KEY` 未配置或配置错误，导致鉴权失败。
+
 #### 3. 添加结构化记忆 (`add`)
 
 将预先结构化的文件（Markdown, JSONL, LoCoMo JSON）直接导入 LanceDB，不进行蒸馏。

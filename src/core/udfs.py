@@ -9,6 +9,50 @@ from daft import DataType
 
 logger = logging.getLogger(__name__)
 
+
+def _build_litellm_completion_kwargs(model: str, api_key: Optional[str], base_url: Optional[str]) -> Dict[str, Any]:
+    """Build provider-aware kwargs for litellm.completion.
+
+    - When model starts with 'volcengine/', treat this as Doubao/Volcengine provider.
+      In this case we do not pass base_url, and we prefer VOLCENGINE_API_KEY / ARK_API_KEY.
+    - Otherwise, treat as OpenAI/OpenAI-compatible provider and respect base_url if present.
+    """
+    provider = "volcengine" if isinstance(model, str) and model.startswith("volcengine/") else "openai"
+
+    effective_api_key = api_key or ""
+    if not effective_api_key:
+        if provider == "volcengine":
+            effective_api_key = (
+                os.getenv("VOLCENGINE_API_KEY")
+                or os.getenv("ARK_API_KEY")
+                or ""
+            )
+            if not effective_api_key:
+                effective_api_key = os.getenv("OPENAI_API_KEY", "")
+        else:
+            effective_api_key = (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("VOLCENGINE_API_KEY")
+                or os.getenv("ARK_API_KEY")
+                or ""
+            )
+
+    kwargs: Dict[str, Any] = {"model": model, "custom_llm_provider": provider}
+    if effective_api_key:
+        kwargs["api_key"] = effective_api_key
+
+    if provider == "openai" and base_url:
+        # LiteLLM OpenAI-compatible endpoints expect a `/v1` suffix on the base URL.
+        # We don't hard-fail here but emit a warning to help catch common misconfigurations.
+        if not base_url.rstrip("/").endswith("/v1"):
+            logger.warning(
+                "OpenAI-compatible base_url '%s' does not end with '/v1'; this may cause routing errors.",
+                base_url,
+            )
+        kwargs["base_url"] = base_url
+
+    return kwargs
+
 @daft.udf(return_dtype=DataType.string())
 def read_file_udf(path_col):
     """Read text content from files."""
@@ -74,25 +118,19 @@ class ExtractionUDF:
         try:
             from litellm import completion
             print(f"[DEBUG] Calling LiteLLM for {path} with model {self.model}...")
-            
-            # LiteLLM handles various providers. 
-            # If using OpenAI compatible endpoints (like Doubao/Volcengine), 
-            # we might need to adjust model name or base_url.
-            # For standard OpenAI compatible:
+
+            kwargs = _build_litellm_completion_kwargs(self.model, self.api_key, self.base_url)
             response = completion(
-                model=self.model,
                 messages=[
                     {"role": "system", "content": self.prompt},
                     {"role": "user", "content": text},
                 ],
-                api_key=self.api_key,
-                base_url=self.base_url,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                custom_llm_provider="openai" # Force OpenAI protocol
+                **kwargs,
             )
             content = response.choices[0].message.content or ""
-            print(f"[DEBUG] LLM Response for {path}: {content[:200]}...") # Print first 200 chars
+            print(f"[DEBUG] LLM Response for {path}: {content[:200]}...")  # Print first 200 chars
             return self._parse_json(content, path)
         except Exception as exc:
             logger.error(f"Distill failed for {path}: {exc}")
@@ -261,30 +299,24 @@ class QAUDF:
             if not q:
                 results.append("")
                 continue
-            
+
             if self.dry_run:
                 results.append(f"Dry-run answer to: {q}")
                 continue
-                
+
             try:
                 from litellm import completion
                 user_content = f"Question: {q}\n\nRelated Memories:\n{ctx}"
-                
-                # For custom OpenAI-compatible providers like Doubao, we need to specify custom_llm_provider="openai"
-                # or prefix the model name with "openai/" if the base_url is set.
-                # Since we have base_url, we can treat it as generic OpenAI compatible.
-                
+
+                kwargs = _build_litellm_completion_kwargs(self.model, self.api_key, self.base_url)
                 resp = completion(
-                    model=self.model, # litellm might expect "openai/doubao..." if we want to force openai client usage
                     messages=[
                         {"role": "system", "content": self.prompt},
-                        {"role": "user", "content": user_content}
+                        {"role": "user", "content": user_content},
                     ],
-                    api_key=self.api_key,
-                    base_url=self.base_url,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
-                    custom_llm_provider="openai" # Force OpenAI protocol
+                    **kwargs,
                 )
                 results.append(resp.choices[0].message.content or "")
             except Exception as e:
@@ -312,36 +344,34 @@ class JudgeUDF:
             if self.dry_run:
                 results.append({"score": 5, "reasoning": "Dry-run pass", "label": "CORRECT"})
                 continue
-            
+
             try:
                 from litellm import completion
                 user_content = self.user_template.format(
                     question=q,
                     answer=ans,
-                    ground_truth=gt
+                    ground_truth=gt,
                 )
+                kwargs = _build_litellm_completion_kwargs(self.model, self.api_key, self.base_url)
                 resp = completion(
-                    model=self.model,
                     messages=[
                         {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_content}
+                        {"role": "user", "content": user_content},
                     ],
-                    api_key=self.api_key,
-                    base_url=self.base_url,
-                    temperature=0.0, # Judge should be deterministic
+                    temperature=0.0,  # Judge should be deterministic
                     max_tokens=1024,
-                    custom_llm_provider="openai" # Force OpenAI protocol
+                    **kwargs,
                 )
                 content = resp.choices[0].message.content or ""
-                
+
                 # Simple parsing for now - assumes JSON or clear structure
                 # In EverMemOS judge prompt, it outputs JSON.
                 try:
                     parsed = self._parse_json(content)
                     results.append(parsed)
-                except:
+                except Exception:
                     results.append({"score": 0, "reasoning": "Failed to parse judge output", "raw": content})
-                    
+
             except Exception as e:
                 logger.error(f"Judge failed: {e}")
                 results.append({"score": 0, "reasoning": str(e)})

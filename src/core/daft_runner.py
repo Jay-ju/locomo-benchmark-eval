@@ -67,6 +67,23 @@ class DaftPromptRunner:
         self._daft_col = col
         self._daft_DataType = DataType
 
+    def _resolve_llm_api_key(self) -> str:
+        """Resolve API key for chat-based LLM calls used by Daft UDFs.
+
+        Preference order:
+        1) Explicit openai_api_key passed to DaftPromptRunner
+        2) OPENAI_API_KEY
+        3) VOLCENGINE_API_KEY
+        4) ARK_API_KEY
+        """
+        return (
+            self.openai_api_key
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("VOLCENGINE_API_KEY")
+            or os.getenv("ARK_API_KEY")
+            or ""
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -89,7 +106,7 @@ class DaftPromptRunner:
         # Apply ReadFileUDF
         df = df.with_column("text", read_file_udf(col("path")))
 
-        # Apply daft.functions.prompt
+        # Apply ExtractionUDF via LiteLLM
         if self.dry_run:
             df = df.with_column(
                 "entries",
@@ -100,70 +117,25 @@ class DaftPromptRunner:
                     prompt=self.prompt,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
-                    dry_run=True
-                )(col("text"), col("path"))
+                    dry_run=True,
+                )(col("text"), col("path")),
             )
         else:
-            # Configure Daft provider
-            daft.set_provider(
-                "openai",
-                base_url=self.openai_base_url or os.getenv("OPENAI_BASE_URL"),
-                api_key=self.openai_api_key or os.getenv("OPENAI_API_KEY"),
-            )
-            
-            # Use daft.functions.prompt
-            # Note: daft.functions.prompt returns a string expression
-            # We need to parse it later or use a UDF to parse the result string
-            
-            # The prompt function usage:
-            # daft.functions.prompt(col("text"), system_message=self.prompt, model=self.model)
-            
-            df = df.with_column(
-                "llm_response",
-                daft.functions.prompt(
-                    col("text"),
-                    system_message=self.prompt,
-                    model=self.model,
-                    temperature=self.temperature,
-                    # max_tokens=self.max_tokens  # Removed max_tokens as it causes TypeError
-                )
-            )
-            
-            # Parse the JSON string result using a simple UDF
-            @daft.udf(return_dtype=DataType.python())
-            def parse_response_udf(response_col, path_col):
-                import json
-                results = []
-                for content, path in zip(response_col, path_col):
-                    if not content:
-                        results.append([])
-                        continue
-                    
-                    content = content.strip()
-                    if content.startswith("```"):
-                        lines = content.splitlines()
-                        if len(lines) >= 3:
-                            content = "\n".join(lines[1:-1]).strip()
-                    
-                    try:
-                        parsed = json.loads(content)
-                        if isinstance(parsed, list):
-                            normalized = []
-                            for item in parsed:
-                                if isinstance(item, dict):
-                                    if "metadata" not in item:
-                                        item["metadata"] = {}
-                                    item["metadata"]["source_path"] = path
-                                    normalized.append(item)
-                            results.append(normalized)
-                        else:
-                            results.append([])
-                    except Exception as e:
-                        logger.error(f"Failed to parse JSON for {path}: {e}")
-                        results.append([])
-                return results
+            effective_api_key = self._resolve_llm_api_key()
+            effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
 
-            df = df.with_column("entries", parse_response_udf(col("llm_response"), col("path")))
+            df = df.with_column(
+                "entries",
+                ExtractionUDF.with_init_args(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                    model=self.model,
+                    prompt=self.prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    dry_run=False,
+                )(col("text"), col("path")),
+            )
 
         collected = df.collect()
         result = collected.to_pydict()
@@ -379,17 +351,20 @@ class DaftPromptRunner:
 
         # Use QAUDF (Class UDF)
         # We need to call .with_init_args() on the UDF wrapper first
+        effective_api_key = self._resolve_llm_api_key()
+        effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+
         df = df.with_column(
             "answer",
             QAUDF.with_init_args(
-                api_key=self.openai_api_key or os.getenv("OPENAI_API_KEY") or "",
-                base_url=self.openai_base_url or "",
+                api_key=effective_api_key,
+                base_url=effective_base_url,
                 model=self.model,
-                prompt=self.prompt, # This will be the QA system prompt
+                prompt=self.prompt,  # This will be the QA system prompt
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                dry_run=self.dry_run
-            )(col("question"), col("context"))
+                dry_run=self.dry_run,
+            )(col("question"), col("context")),
         )
 
         collected = df.collect().to_pydict()
@@ -430,16 +405,19 @@ class DaftPromptRunner:
         })
 
         # Use JudgeUDF (Class UDF)
+        effective_api_key = self._resolve_llm_api_key()
+        effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+
         df = df.with_column(
             "judge_result",
             JudgeUDF.with_init_args(
-                api_key=self.openai_api_key or os.getenv("OPENAI_API_KEY") or "",
-                base_url=self.openai_base_url or "",
+                api_key=effective_api_key,
+                base_url=effective_base_url,
                 model=self.model,
                 system_prompt=JUDGE_SYSTEM_PROMPT,
                 user_template=JUDGE_USER_TEMPLATE,
-                dry_run=self.dry_run
-            )(col("question"), col("answer"), col("ground_truth"))
+                dry_run=self.dry_run,
+            )(col("question"), col("answer"), col("ground_truth")),
         )
 
         collected = df.collect().to_pydict()
