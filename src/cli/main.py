@@ -1092,17 +1092,31 @@ def judge(
 
     judged_results = runner.judge_batch(qa_results)
     
-    # Calculate average score
+    # Calculate average score and collect failures
     scores = []
+    failures = []
     for item in judged_results:
         res = item.get("judge_result", {})
         if isinstance(res, dict):
             s = res.get("score")
             if isinstance(s, (int, float)):
                 scores.append(s)
+                if s < 1.0:
+                    failures.append(item)
     
     avg_score = sum(scores) / len(scores) if scores else 0.0
-    typer.echo(f"Judge completed. Average Score: {avg_score:.2f} / 5.0")
+    typer.echo(f"Judge completed. Task Completion Rate (Accuracy): {avg_score:.2%}")
+
+    if failures:
+        typer.echo(f"\n=== Failure Report ({len(failures)} tasks failed) ===")
+        for f in failures:
+            uid = f.get("user_id", "unknown")
+            q = f.get("question", "")
+            # Truncate question for display
+            q_display = (q[:60] + "...") if len(q) > 60 else q
+            reason = f.get("judge_result", {}).get("reasoning", "No reasoning")
+            typer.echo(f"[User: {uid}] Q: {q_display} -> {reason}")
+        typer.echo("===========================================\n")
 
     json_str = json.dumps(judged_results, ensure_ascii=False, indent=2)
     target_path = output or results_file

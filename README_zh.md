@@ -104,11 +104,29 @@ python -m src.cli.main eval \
 
 **步骤 3: 评分 (Judge)**
 
+使用 LLM-as-a-Judge 评估回答的准确性。
+
 ```bash
 python -m src.cli.main judge \
   results/locomo_results.json \
   --output results/locomo_judged.json
 ```
+
+**Judge 说明**:
+*   **输入格式**: JSON 列表，每个对象需包含 `question`, `answer`, `ground_truth`。
+*   **评分逻辑**: LLM 会对比 `answer` 和 `ground_truth`，判断是否正确 (`CORRECT` 或 `WRONG`)。
+*   **输出格式**: 在原对象中追加 `judge_result` 字段：
+    ```json
+    "judge_result": {
+      "label": "CORRECT",
+      "reasoning": "回答提到了关键信息...",
+      "score": 1.0
+    }
+    ```
+*   **控制台报告**:
+    *   **Task Completion Rate (Accuracy)**: 总体准确率 (e.g. 85.00%)。
+    *   **Failure Report**: 列出所有失败任务的 User ID、问题摘要及失败原因，便于快速定位问题人物。
+*   **最终得分**: 计算所有问题的平均分 (Accuracy, 0.0 - 1.0)。
 
 ### 架构说明
 

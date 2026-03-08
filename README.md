@@ -121,6 +121,22 @@ python -m src.cli.main judge \
   --output results/locomo_judged.json
 ```
 
+**Judge Details**:
+*   **Input Format**: JSON list of objects containing `question`, `answer`, `ground_truth`.
+*   **Logic**: LLM compares `answer` vs `ground_truth` and labels it `CORRECT` or `WRONG`.
+*   **Output Format**: Appends `judge_result` to each object:
+    ```json
+    "judge_result": {
+      "label": "CORRECT",
+      "reasoning": "The answer mentions key details...",
+      "score": 1.0
+    }
+    ```
+*   **Console Report**:
+    *   **Task Completion Rate (Accuracy)**: Overall accuracy percentage.
+    *   **Failure Report**: Lists all failed tasks with User ID, Question snippet, and Reasoning for quick review.
+*   **Final Score**: Average Accuracy (0.0 - 1.0).
+
 ### Architecture
 
 #### Direct Pipeline Mode (`--mode direct`)
