@@ -192,83 +192,82 @@ class LanceDBVectorStore(VectorStoreAdapter):
         *,
         top_k: int = 10,
         min_score: float = 0.3,
+        user_id: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Vector search using LanceDB's search API.
 
         The scoring semantics follow ``memory-lancedb-pro``: LanceDB's
         internal distance (``_distance``) is converted to a similarity
-        score via ``score = 1 / (1 + distance)`` and filtered by
-        ``min_score``. Results are truncated to ``top_k``.
-        """
+        score (1.0 - distance).
 
-        if top_k <= 0:
+        If user_id is provided, filters for scope == 'global' OR scope == 'user:{user_id}'.
+        """
+        if self._table is None:
+            self._ensure_table()
+            if self._table is None:
+                return []
+
+        # Ensure query vector is a list
+        vec = list(query_vector)
+
+        # Build filter
+        where_clause = None
+        if user_id:
+            # Match global OR specific user scope
+            # Note: LanceDB SQL filter syntax
+            # We use a raw SQL string for flexibility
+            # Escaping user_id is important if it comes from untrusted input,
+            # but here we assume internal usage.
+            safe_uid = user_id.replace("'", "''")
+            where_clause = f"scope = 'global' OR scope = 'user:{safe_uid}'"
+
+        try:
+            query = self._table.search(vec).limit(top_k)
+
+            if where_clause:
+                query = query.where(where_clause)
+
+            results = query.to_list()
+        except Exception as exc:
+            logger.error("LanceDB search failed: %s", exc)
             return []
 
-        if len(query_vector) != self.config.vector_dim:
-            raise ValueError(
-                f"Vector dimension mismatch: expected {self.config.vector_dim}, got {len(query_vector)}",
-            )
+        normalized = []
+        for r in results:
+            # Calculate similarity score from distance
+            # LanceDB default metric is often L2 or Cosine distance depending on index
+            # If using cosine distance, range is [0, 2].
+            # Usually for normalized vectors and cosine distance: distance = 1 - cosine_similarity
+            # So similarity = 1 - distance.
+            dist = r.get("_distance", 1.0)
+            score = 1.0 - dist
 
-        self._ensure_table()
-        assert self._table is not None
-
-        # Over-fetch to give min_score some headroom, mirroring the TS
-        # implementation in memory-lancedb-pro.
-        safe_k = max(1, int(top_k))
-        fetch_limit = min(safe_k * 10, 200)
-
-        table = self._table
-        # Best-effort support for different LanceDB Python APIs.
-        search_method = getattr(table, "search", None)
-        if callable(search_method):
-            query = search_method(list(query_vector))
-        else:  # pragma: no cover - fallback path
-            alt = getattr(table, "vector_search", None) or getattr(table, "vectorSearch", None)
-            if not callable(alt):
-                raise RuntimeError(
-                    "LanceDB table does not expose a compatible vector search API ('search' or 'vector_search').",
-                )
-            query = alt(list(query_vector))
-
-        try:  # pragma: no cover - depends on lancedb runtime
-            rows = query.limit(fetch_limit).to_list()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("LanceDB vector_search failed: %s", exc)
-            raise
-
-        results: List[Dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-
-            try:
-                dist = float(row.get("_distance", 0.0))
-            except Exception:
-                dist = 0.0
-            score = 1.0 / (1.0 + dist)
             if score < min_score:
                 continue
 
-            scope_val = row.get("scope")
-            scope_str = scope_val if isinstance(scope_val, str) and scope_val else "global"
+            # Parse metadata if it's a string
+            meta = r.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    import json
+                    meta = json.loads(meta)
+                except Exception:
+                    pass
 
-            entry: Dict[str, Any] = {
-                "id": row.get("id"),
-                "text": row.get("text", ""),
-                "vector": list(row.get("vector") or []),
-                "category": row.get("category", "other"),
-                "scope": scope_str,
-                "importance": float(row.get("importance", 0.0)),
-                "timestamp": int(row.get("timestamp", 0)),
-                "metadata": row.get("metadata", "{}"),
+            item = {
+                "id": r.get("id"),
+                "text": r.get("text"),
+                "vector": r.get("vector"),
+                "category": r.get("category"),
+                "scope": r.get("scope"),
+                "importance": r.get("importance"),
+                "timestamp": r.get("timestamp"),
+                "metadata": meta,
                 "score": score,
             }
-            results.append(entry)
+            normalized.append(item)
 
-            if len(results) >= safe_k:
-                break
-
-        return results
+        return normalized
 
 
 # ----------------------------------------------------------------------

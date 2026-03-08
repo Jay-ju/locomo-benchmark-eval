@@ -7,7 +7,7 @@ from pathlib import Path
 from .prompts.extraction import SESSION_EXTRACTION_PROMPT
 from .prompts.judge import JUDGE_SYSTEM_PROMPT, JUDGE_USER_TEMPLATE
 from .prompts.qa import QA_SYSTEM_PROMPT
-from .udfs import read_file_udf, ExtractionUDF, QAUDF, JudgeUDF
+from .udfs import ExtractionUDF, JudgeUDF, QAUDF, SearchUDF, read_file_udf, OpenClawQAUDF, OpenClawIngestUDF
 from ..adapters.embedder import EmbedderAdapter, OpenAICompatibleEmbedder, OpenAICompatibleConfig
 from .models import MemoryEntryPayload, StoredMemoryEntry
 from ..adapters.vector_store import VectorStoreAdapter
@@ -52,11 +52,11 @@ class DaftPromptRunner:
     temperature: float = 0.2
     parallelism: int = 4
     dry_run: bool = False
+    mode: str = "agent"
+    memory_type: str = "lancedb"
 
     def __post_init__(self) -> None:
-        # Lazy import daft so that the rest of the package remains usable
-        # without it. If Daft is not available, we fail fast with a clear
-        # message.
+        # Lazy import daft
         try:  # pragma: no cover - optional dependency
             import daft  # type: ignore
             from daft import DataType, col  # type: ignore
@@ -66,6 +66,17 @@ class DaftPromptRunner:
         self._daft = daft
         self._daft_col = col
         self._daft_DataType = DataType
+        
+        # Load Memory Plugin
+        from .memory_plugins.registry import get_plugin
+        self.plugin = get_plugin(self.memory_type)
+        
+        # If prompt is None or default, use plugin's prompt
+        # Note: SESSION_EXTRACTION_PROMPT is the default value in signature.
+        # But if user doesn't pass it, it is equal.
+        # We assume if it equals SESSION_EXTRACTION_PROMPT, we can override with plugin's default.
+        if self.prompt == SESSION_EXTRACTION_PROMPT:
+            self.prompt = self.plugin.get_extraction_prompt()
 
     def _resolve_llm_api_key(self) -> str:
         """Resolve API key for chat-based LLM calls used by Daft UDFs.
@@ -83,6 +94,9 @@ class DaftPromptRunner:
             or os.getenv("ARK_API_KEY")
             or ""
         )
+
+    def _is_agent_mode(self, base_url: str) -> bool:
+        return (self.mode or "").lower() == "agent"
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,50 +120,132 @@ class DaftPromptRunner:
         # Apply ReadFileUDF
         df = df.with_column("text", read_file_udf(col("path")))
 
-        # Apply ExtractionUDF via LiteLLM
-        if self.dry_run:
-            df = df.with_column(
-                "entries",
-                ExtractionUDF.with_init_args(
-                    api_key="",
-                    base_url="",
-                    model=self.model,
-                    prompt=self.prompt,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    dry_run=True,
-                )(col("text"), col("path")),
-            )
-        else:
-            effective_api_key = self._resolve_llm_api_key()
-            effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+        # Delegate to run_dataframe for unified processing
+        processed_df = self.run_dataframe(
+            df, 
+            prompt_type="ingest", 
+            text_col="text", 
+            id_col="path"
+        )
 
-            df = df.with_column(
-                "entries",
-                ExtractionUDF.with_init_args(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                    model=self.model,
-                    prompt=self.prompt,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    dry_run=False,
-                )(col("text"), col("path")),
-            )
-
-        collected = df.collect()
+        collected = processed_df.collect()
         result = collected.to_pydict()
 
+        effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+        is_agent = self._is_agent_mode(effective_base_url)
+
         all_entries: List[Dict[str, Any]] = []
-        entries_col = result.get("entries", [])
         
-        for entries in entries_col:
-            if not entries:
-                continue
-            if isinstance(entries, list):
-                all_entries.extend(entries)
+        if is_agent:
+            # Agent mode returns strings in "ingest_result"
+            results = result.get("ingest_result", [])
+            for r in results:
+                # Wrap simple status in a structure consistent enough for reporting
+                all_entries.append({"agent_response": r})
+        else:
+            # Direct mode returns list of dicts in "entries"
+            entries_col = result.get("entries", [])
+            for entries in entries_col:
+                if not entries:
+                    continue
+                if isinstance(entries, list):
+                    all_entries.extend(entries)
 
         return all_entries
+
+    def run_dataframe(
+        self,
+        df: Any,  # daft.DataFrame
+        prompt_type: str = "qa",  # "qa" or "ingest"
+        text_col: str = "text",
+        id_col: Optional[str] = None,
+    ) -> Any:  # daft.DataFrame
+        """
+        Run LLM processing on a Daft DataFrame directly.
+        Supports 'qa' and 'ingest' modes, switching between local and OpenClaw implementations.
+        """
+        daft = self._daft
+        col = self._daft_col
+        
+        effective_api_key = self._resolve_llm_api_key()
+        effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+        
+        # Detect mode
+        is_openclaw = self._is_agent_mode(effective_base_url)
+
+        if prompt_type == "ingest":
+            if is_openclaw:
+                # OpenClaw Ingest Mode
+                # For ingest, we need an ID column to potentially derive user_id
+                if not id_col:
+                    # Fallback if no ID column provided
+                    id_col_expr = daft.lit("unknown_source")
+                else:
+                    id_col_expr = col(id_col)
+                
+                return df.with_column(
+                    "ingest_result",
+                    OpenClawIngestUDF.with_init_args(
+                        base_url=effective_base_url,
+                        api_key=effective_api_key,
+                        model=self.model,
+                        dry_run=self.dry_run
+                    )(col(text_col), id_col_expr)
+                )
+            else:
+                # Local Extraction Mode
+                # This usually expects file content in text_col
+                
+                user_id_expr = col("user_id") if "user_id" in df.column_names else daft.lit(None).cast(DataType.string())
+
+                return df.with_column(
+                    "entries",
+                    ExtractionUDF.with_init_args(
+                        api_key=effective_api_key,
+                        base_url=effective_base_url,
+                        model=self.model,
+                        prompt=self.prompt,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        dry_run=self.dry_run,
+                    )(col(text_col), col(id_col) if id_col else daft.lit("unknown"), user_id_expr),
+                )
+
+        elif prompt_type == "qa":
+            if is_openclaw:
+                # OpenClaw QA Mode
+                return df.with_column(
+                    "answer",
+                    OpenClawQAUDF.with_init_args(
+                        base_url=effective_base_url,
+                        api_key=effective_api_key,
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        dry_run=self.dry_run
+                    )(col(text_col))
+                )
+            else:
+                # Local QA Mode
+                # QAUDF expects (question, context)
+                if "context" not in df.column_names:
+                    df = df.with_column("context", daft.lit(""))
+                
+                return df.with_column(
+                    "answer",
+                    QAUDF.with_init_args(
+                        api_key=effective_api_key,
+                        base_url=effective_base_url,
+                        model=self.model,
+                        prompt=self.prompt,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        dry_run=self.dry_run,
+                    )(col(text_col), col("context")),
+                )
+        
+        else:
+            raise ValueError(f"Unknown prompt_type: {prompt_type}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -189,32 +285,31 @@ class DaftPromptRunner:
         payloads: List[MemoryEntryPayload] = []
         for idx, item in enumerate(entries_json):
             try:
-                text = str(item.get("text", "")).strip()
-                if not text:
-                    continue
-
-                category = item.get("category", "other")
-                scope = item.get("scope", "global")
-
-                importance_val = item.get("importance", 0.7)
-                try:
-                    importance = float(importance_val)
-                except Exception:
-                    importance = 0.7
-
-                metadata = item.get("metadata") or {}
-                if not isinstance(metadata, dict):
-                    metadata = {"metadata_raw": metadata}
-
-                payloads.append(
-                    MemoryEntryPayload(
-                        text=text,
-                        category=category,  # type: ignore[arg-type]
-                        scope=scope,
-                        importance=importance,
-                        metadata=metadata,
-                    ),
-                )
+                # The output of ExtractionUDF is now a list of dicts (from JSON parsing)
+                # But daft might return it as a list of structs or similar
+                # We expect dicts here
+                if isinstance(item, dict):
+                    # Use Memory Plugin to normalize entry
+                    normalized = self.plugin.normalize_entry(item)
+                    
+                    text = str(normalized.get("text", "")).strip()
+                    if not text:
+                        continue
+                        
+                    category = normalized.get("category", "other")
+                    scope = normalized.get("scope", "global")
+                    importance = normalized.get("importance", 0.7)
+                    metadata = normalized.get("metadata", {})
+                        
+                    payloads.append(
+                        MemoryEntryPayload(
+                            text=text,
+                            category=category, # type: ignore
+                            scope=scope,
+                            importance=importance,
+                            metadata=metadata
+                        )
+                    )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("DaftPromptRunner: Skipping invalid entry index=%d: %s", idx, exc)
 
@@ -342,10 +437,12 @@ class DaftPromptRunner:
 
         questions = [item.get("question", "") for item in qa_items]
         contexts = [item.get("context", "") for item in qa_items]
+        user_ids = [item.get("user_id") for item in qa_items]
         
         df = daft.from_pydict({
             "question": questions,
             "context": contexts,
+            "user_id": user_ids,
             "original_item": qa_items # Daft handles list of dicts
         })
 
@@ -354,18 +451,34 @@ class DaftPromptRunner:
         effective_api_key = self._resolve_llm_api_key()
         effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
 
-        df = df.with_column(
-            "answer",
-            QAUDF.with_init_args(
-                api_key=effective_api_key,
-                base_url=effective_base_url,
-                model=self.model,
-                prompt=self.prompt,  # This will be the QA system prompt
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                dry_run=self.dry_run,
-            )(col("question"), col("context")),
-        )
+        is_openclaw = self._is_agent_mode(effective_base_url)
+
+        if is_openclaw:
+            logger.info("Using OpenClawQAUDF for QA generation")
+            df = df.with_column(
+                "answer",
+                OpenClawQAUDF.with_init_args(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    dry_run=self.dry_run,
+                )(col("question"), col("user_id")),
+            )
+        else:
+            df = df.with_column(
+                "answer",
+                QAUDF.with_init_args(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                    model=self.model,
+                    prompt=self.prompt,  # This will be the QA system prompt
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    dry_run=self.dry_run,
+                )(col("question"), col("context")),
+            )
 
         collected = df.collect().to_pydict()
         

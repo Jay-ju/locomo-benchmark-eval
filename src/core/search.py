@@ -101,6 +101,7 @@ class SearchRunner:
         *,
         top_k: int = 10,
         min_score: float = 0.3,
+        user_ids: Optional[Sequence[Optional[str]]] = None,
     ) -> List[List[Dict[str, Any]]]:
         """Batch search using Daft for per-query parallelism.
 
@@ -108,6 +109,8 @@ class SearchRunner:
         ----------
         queries:
             A sequence of user queries (one per question).
+        user_ids:
+            Optional sequence of user IDs for scope filtering.
 
         Returns
         -------
@@ -126,12 +129,15 @@ class SearchRunner:
 
         # Normalise input and preserve original indices so we can
         # reconstruct output alignment even if some queries are empty.
+        if user_ids is None:
+            user_ids = [None] * len(queries)
+        
         indexed: List[Dict[str, Any]] = []
-        for idx, q in enumerate(queries):
+        for idx, (q, uid) in enumerate(zip(queries, user_ids)):
             text = (q or "").strip()
             if not text:
                 continue
-            indexed.append({"index": idx, "query": text})
+            indexed.append({"index": idx, "query": text, "user_id": uid})
 
         if not indexed:
             return [[] for _ in queries]

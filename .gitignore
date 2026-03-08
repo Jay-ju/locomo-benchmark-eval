@@ -24,3 +24,8 @@ output/
 
 # Temporary test scripts
 test_*.py
+
+# Generated data
+data/locomo/*.jsonl
+data/evaluation/*.jsonl
+data/test_*

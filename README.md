@@ -4,135 +4,151 @@
 
 ---
 
-**Locomo Benchmark Eval (locomo_eval)** is a CLI tool designed for the OpenClaw ecosystem to facilitate memory import and evaluation. It draws inspiration from and supports the evaluation datasets of [EverMemOS](https://github.com/EverMind-AI/EverMemOS/tree/main/evaluation), providing a streamlined workflow for memory distillation, retrieval, and QA evaluation.
+**Locomo Benchmark Eval (locomo_eval)** is a robust evaluation framework designed for AI Memory systems, specifically targeting **OpenClaw** and the **LoCoMo Benchmark**. It supports a dual-mode evaluation architecture:
+
+1.  **Direct Pipeline Mode**: Uses the internal RAG pipeline (Ingest -> VectorDB -> Retrieval -> LLM QA). This runs entirely within the evaluation tool, connecting directly to LLMs and Vector Stores. Ideal for testing embedding models and retrieval algorithms in isolation.
+2.  **Agent Mode**: Evaluates a running Agent (e.g., OpenClaw) by interacting with it via chat APIs (Ingest via "Remember this", QA via Chat). Ideal for end-to-end system evaluation.
 
 ### Features
 
-- **Store Agnostic**: Defaults to **LanceDB**, with interfaces reserved for FAISS / Milvus / Viking.
-- **Pluggable Embedding**: Supports OpenAI-compatible providers (OpenAI, Jina, Voyage, Ollama, Doubao/Volcano, etc.) or local **dry-run** (random vectors) for testing.
-- **Memory Distillation**: `session-distill` command uses LLM to extract atomic memories from conversation logs, similar to the memory formation process in EverMemOS.
-- **Evaluation**: `search`, `search-batch`, and `qa` commands for verifying memory retrieval and answering capabilities.
+- **Dual-Mode Evaluation**: Switch between Agent Mode (Default) and Direct Pipeline via `--mode agent` or `--mode direct`.
+- **LoCoMo Benchmark Support**: Built-in converter for LoCoMo dataset.
+- **Store Agnostic**: Defaults to **LanceDB**.
+- **Pluggable Embedding**: Supports OpenAI-compatible providers.
+- **Distributed Processing**: Uses **Daft**.
 
 ### Installation
 
 ```bash
 cd locomo-benchmark-eval
 pip install -e .
-# Now you can use the `locomo_eval` command or `python -m src.cli.main`
 ```
 
-### Usage
+### Network Configuration (Proxy)
 
-#### 1. Ingest Memories (`ingest`)
-
-Extract atomic memories from conversation logs using an LLM (Session Distillation). This is the primary way to build memory from raw chat logs.
+If you encounter network issues when downloading HuggingFace models, set proxy environment variables:
 
 ```bash
-# Ensure your .env file is configured with LLM/Embedding keys
+export http_proxy=http://sys-proxy-rd-relay.byted.org:8118
+export https_proxy=http://sys-proxy-rd-relay.byted.org:8118
+export no_proxy=code.byted.org
+```
+
+### Quick Start
+
+#### 1. Configuration (`.env`)
+
+Create a `.env` file with your credentials:
+
+```bash
+# === Common ===
+# For Agent Mode (OpenClaw)
+# OPENAI_BASE_URL=http://localhost:18789/v1
+# OPENAI_API_KEY=openclaw-secret
+# OPENAI_MODEL=ark/doubao-seed-2-0-pro-260215
+
+# For Direct Mode (Internal Pipeline)
+OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+OPENAI_API_KEY=your-volcengine-key
+OPENAI_MODEL=doubao-pro-32k
+
+# === Embedding (Direct Mode Only) ===
+# Option 1: Doubao / OpenAI
+EMBEDDING_PROVIDER=doubao
+EMBEDDING_API_KEY=your-volcengine-key
+EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
+EMBEDDING_MODEL=doubao-embedding-vision
+VECTOR_DIM=2048
+
+# Option 2: Local HuggingFace (BGE)
+# EMBEDDING_PROVIDER=local-huggingface
+# EMBEDDING_MODEL=BAAI/bge-m3 (or local path)
+# VECTOR_DIM=1024
+```
+
+#### 2. LoCoMo Benchmark Workflow
+
+**Step 1: Ingest Memories**
+
+You can ingest the entire dataset or filter specific samples/sessions.
+
+```bash
+# Ingest entire dataset (Default)
+python -m src.cli.main ingest data/locomo/locomo10.json
+
+# Ingest specific sample and sessions
+# e.g., Sample 0, Sessions 1-4, assigning a specific User ID
 python -m src.cli.main ingest \
-  ./sessions/chat.txt \
-  --db-path ./tmp_lancedb \
-  --model gpt-4o-mini
+  data/locomo/locomo10.json \
+  --sample 0 \
+  --sessions 1-4 \
+  --user my-user-uuid
+
+# Using Local BGE Model (Direct Mode)
+python -m src.cli.main ingest \
+  data/locomo/locomo10.json \
+  --mode direct \
+  --embed-provider local-huggingface \
+  --embed-model BAAI/bge-m3 \
+  --vector-dim 1024
 ```
 
-#### 2. Evaluate QA Performance (`eval`)
+**Step 2: Evaluate (QA)**
 
-End-to-end Retrieval-Augmented Generation (RAG) evaluation: Retrieve relevant memories and generate answers.
+Run QA against the ingested context.
 
 ```bash
+# Evaluate entire dataset
 python -m src.cli.main eval \
-  ./questions.txt \
-  --db-path ./tmp_lancedb \
-  --output qa_results.json
+  data/locomo/locomo10.json \
+  --output results/locomo_results.json
+
+# Evaluate specific sample with specific User ID context
+python -m src.cli.main eval \
+  data/locomo/locomo10.json \
+  --sample 0 \
+  --user my-user-uuid \
+  --output results/sample0_results.json
 ```
 
-#### 3. Add Structured Memories (`add`)
+**Step 3: Judge**
 
-Import pre-structured files (Markdown, JSONL, LoCoMo JSON) directly into LanceDB without distillation.
-
-```bash
-python -m src.cli.main add \
-  ./data/memories \
-  --store-type lancedb \
-  --db-path ./tmp_lancedb
-```
-
-#### 4. Debug Search (`search` / `search-batch`)
-
-Manually inspect retrieval results to debug memory quality.
-
-```bash
-# Single query
-python -m src.cli.main search "What does the user like?" --db-path ./tmp_lancedb
-
-# Batch search
-python -m src.cli.main search-batch ./queries.txt --output results.json
-```
-
-#### 5. Judge QA Results (`judge`)
-
-Use an LLM-as-a-Judge to evaluate the quality of the generated answers against ground truth (or plausibility).
+Evaluate the accuracy of the answers using an LLM-as-a-Judge.
 
 ```bash
 python -m src.cli.main judge \
-  ./qa_results.json \
-  --output judged_results.json \
-  --model gpt-4o-mini
+  results/locomo_results.json \
+  --output results/locomo_judged.json
 ```
 
----
+### Architecture
 
-## Evaluation Benchmark Workflow
+#### Direct Pipeline Mode (`--mode direct`)
+- **Ingest**: File -> `ExtractionUDF` (LLM) -> `LanceDB`
+- **Eval**: Question -> `VectorSearch` (LanceDB) -> `QAUDF` (LLM) -> Answer
 
-We provide a sample dataset in `data/` to demonstrate the full evaluation lifecycle (Ingest -> Eval -> Judge).
+#### Agent Mode (`--mode agent`)
+- **Ingest**: File -> `OpenClawIngestUDF` -> HTTP POST `/v1/chat/completions` (OpenClaw)
+- **Eval**: Question -> `OpenClawQAUDF` -> HTTP POST `/v1/chat/completions` (OpenClaw)
 
-### Step 1: Ingest Sample Chat Logs
 
-Use `ingest` to extract memories from conversation logs. You can provide any text file (e.g., `.txt`, `.md`, `.jsonl`) containing conversation transcripts.
+### Data Format
 
-*Note: `data/chat_logs/sample_chat.txt` is just an example path. You can point this to any file or directory containing your conversation data.*
-
-```bash
-python -m src.cli.main ingest \
-  ./data/chat_logs/sample_chat.txt \
-  --db-path ./tmp_lancedb_eval
+**Ingest JSONL**:
+```json
+{
+  "text": "User: I love coding.\nAI: That's great!",
+  "path": "source/path/session_1",
+  "user_id": "user_123",  // Used for scoping
+  "timestamp": "2023-10-01"
+}
 ```
 
-### Step 2: Run Evaluation
-
-Run the sample questions against the distilled memories. The system will retrieve relevant context and generate answers.
-
-```bash
-python -m src.cli.main eval \
-  ./data/questions.txt \
-  --db-path ./tmp_lancedb_eval \
-  --output ./data/qa_results.json
+**Eval JSONL**:
+```json
+{
+  "question": "What does the user love?",
+  "ground_truth": "Coding",
+  "user_id": "user_123"  // Ensures QA is scoped to the correct user
+}
 ```
-
-### Step 3: Run Judge (Optional)
-
-Evaluate the quality of the answers using an LLM Judge.
-
-```bash
-python -m src.cli.main judge \
-  ./data/qa_results.json \
-  --output ./data/judged_results.json
-```
-
-### Step 4: Review Results
-
-Check the output file `data/judged_results.json` to see the questions, answers, and their scores (1-5) with reasoning.
-
----
-
-## Official Benchmark Data
-
-We also include the official benchmark datasets from `EverMemOS` in `data/`. This includes:
-
-- **LoCoMo**: Long-Context Memory Benchmark (`data/locomo/locomo10.json`)
-- **LongMemEval**: Multi-session conversation evaluation (`data/longmemeval/`)
-- **PersonaMem**: Persona consistency evaluation (`data/personamem/`)
-
-These datasets contain rich, multi-session conversation logs and QA pairs, suitable for advanced evaluation of long-term memory systems.
-
-> **Note**: These files are in JSON format. You may need to extract the conversation text for `session-distill` or use custom scripts to process them.

@@ -42,13 +42,6 @@ def _build_litellm_completion_kwargs(model: str, api_key: Optional[str], base_ur
         kwargs["api_key"] = effective_api_key
 
     if provider == "openai" and base_url:
-        # LiteLLM OpenAI-compatible endpoints expect a `/v1` suffix on the base URL.
-        # We don't hard-fail here but emit a warning to help catch common misconfigurations.
-        if not base_url.rstrip("/").endswith("/v1"):
-            logger.warning(
-                "OpenAI-compatible base_url '%s' does not end with '/v1'; this may cause routing errors.",
-                base_url,
-            )
         kwargs["base_url"] = base_url
 
     return kwargs
@@ -91,30 +84,31 @@ class ExtractionUDF:
             # litellm uses environment variables or passed args
             pass
 
-    def __call__(self, text_col, path_col):
+    def __call__(self, text_col, path_col, user_id_col):
         results = []
-        for text, path in zip(text_col, path_col):
+        for text, path, uid in zip(text_col, path_col, user_id_col):
             if not text:
                 results.append([])
                 continue
             
             if self.dry_run:
-                results.append(self._fake_distill(path, text))
+                results.append(self._fake_distill(path, text, uid))
             else:
-                results.append(self._distill(path, text))
+                results.append(self._distill(path, text, uid))
         return results
 
-    def _fake_distill(self, path: str, text: str) -> List[Dict[str, Any]]:
+    def _fake_distill(self, path: str, text: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         filename = Path(path).name if path else "unknown"
+        scope = f"user:{user_id}" if user_id else "global"
         return [{
             "text": f"Dry-run memory from {filename}",
             "category": "fact",
-            "scope": "global",
+            "scope": scope,
             "importance": 0.5,
             "metadata": {"source": "dry-run", "path": path}
         }]
 
-    def _distill(self, path: str, text: str) -> List[Dict[str, Any]]:
+    def _distill(self, path: str, text: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
             from litellm import completion
             print(f"[DEBUG] Calling LiteLLM for {path} with model {self.model}...")
@@ -131,7 +125,14 @@ class ExtractionUDF:
             )
             content = response.choices[0].message.content or ""
             print(f"[DEBUG] LLM Response for {path}: {content[:200]}...")  # Print first 200 chars
-            return self._parse_json(content, path)
+            parsed = self._parse_json(content, path)
+            
+            if user_id:
+                scope_str = f"user:{user_id}"
+                for item in parsed:
+                    if isinstance(item, dict):
+                        item["scope"] = scope_str
+            return parsed
         except Exception as exc:
             logger.error(f"Distill failed for {path}: {exc}")
             return []
@@ -221,6 +222,7 @@ class SearchUDF:
                 continue
             
             query = payload.get("query", "").strip()
+            user_id = payload.get("user_id")
             if not query:
                 results.append([])
                 continue
@@ -239,7 +241,8 @@ class SearchUDF:
                 raw_results = self.store.vector_search(
                     vector,
                     top_k=self.top_k,
-                    min_score=self.min_score
+                    min_score=self.min_score,
+                    user_id=user_id
                 )
                 
                 # 3. Normalize
@@ -307,8 +310,12 @@ class QAUDF:
             try:
                 from litellm import completion
                 user_content = f"Question: {q}\n\nRelated Memories:\n{ctx}"
+                
+                # Debugging log for input content
+                print(f"[DEBUG] QA Input User Content:\n{user_content[:500]}...") # Print first 500 chars
 
                 kwargs = _build_litellm_completion_kwargs(self.model, self.api_key, self.base_url)
+                print(f"[DEBUG] QA Call - Model: {self.model}, Question: {q[:50]}...")
                 resp = completion(
                     messages=[
                         {"role": "system", "content": self.prompt},
@@ -318,7 +325,9 @@ class QAUDF:
                     max_tokens=self.max_tokens,
                     **kwargs,
                 )
-                results.append(resp.choices[0].message.content or "")
+                content = resp.choices[0].message.content or ""
+                print(f"[DEBUG] QA Response: {content[:100]}...")
+                results.append(content)
             except Exception as e:
                 logger.error(f"QA failed: {e}")
                 results.append("Error generating answer")
@@ -353,6 +362,7 @@ class JudgeUDF:
                     ground_truth=gt,
                 )
                 kwargs = _build_litellm_completion_kwargs(self.model, self.api_key, self.base_url)
+                print(f"[DEBUG] Judge Call - Model: {self.model}, Question: {q[:50]}...")
                 resp = completion(
                     messages=[
                         {"role": "system", "content": self.system_prompt},
@@ -363,14 +373,25 @@ class JudgeUDF:
                     **kwargs,
                 )
                 content = resp.choices[0].message.content or ""
+                print(f"[DEBUG] Judge Response: {content[:100]}...")
 
                 # Simple parsing for now - assumes JSON or clear structure
                 # In EverMemOS judge prompt, it outputs JSON.
                 try:
                     parsed = self._parse_json(content)
+                    
+                    # Map label to score
+                    label = str(parsed.get("label", "")).upper()
+                    if label == "CORRECT":
+                        parsed["score"] = 1.0
+                    elif label == "WRONG":
+                        parsed["score"] = 0.0
+                    else:
+                        parsed["score"] = 0.0  # Default if label unknown
+                        
                     results.append(parsed)
                 except Exception:
-                    results.append({"score": 0, "reasoning": "Failed to parse judge output", "raw": content})
+                    results.append({"score": 0.0, "reasoning": "Failed to parse judge output", "raw": content})
 
             except Exception as e:
                 logger.error(f"Judge failed: {e}")
@@ -385,3 +406,93 @@ class JudgeUDF:
             if len(lines) >= 3:
                 content = "\n".join(lines[1:-1]).strip()
         return json.loads(content)
+
+
+@daft.udf(return_dtype=DataType.string())
+class OpenClawQAUDF:
+    def __init__(self, base_url: str, api_key: str, model: str, temperature: float, max_tokens: int, dry_run: bool):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.dry_run = dry_run
+
+    def __call__(self, question_col, user_id_col=None):
+        results = []
+        user_ids = user_id_col if user_id_col else [None] * len(question_col)
+        
+        for q, uid in zip(question_col, user_ids):
+            if not q:
+                results.append("")
+                continue
+            
+            if self.dry_run:
+                results.append(f"Dry-run OpenClaw answer to: {q}")
+                continue
+                
+            try:
+                from .openclaw_client import OpenClawClient
+                client = OpenClawClient(base_url=self.base_url, api_key=self.api_key)
+                
+                # We send just the question. OpenClaw handles retrieval internally.
+                messages = [{"role": "user", "content": q}]
+                
+                answer = client.chat_completion(
+                    messages=messages,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    user_id=uid
+                )
+                results.append(answer)
+            except Exception as e:
+                logger.error(f"OpenClaw QA failed: {e}")
+                results.append("Error generating answer")
+        return results
+
+
+@daft.udf(return_dtype=DataType.string())
+class OpenClawIngestUDF:
+    def __init__(self, base_url: str, api_key: str, model: str, dry_run: bool):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self.dry_run = dry_run
+
+    def __call__(self, text_col, path_col, user_id_col=None):
+        results = []
+        user_ids = user_id_col if user_id_col else [None] * len(text_col)
+        
+        for text, path, uid in zip(text_col, path_col, user_ids):
+            if not text:
+                results.append("Skipped: empty text")
+                continue
+            
+            if self.dry_run:
+                results.append(f"Dry-run ingest: {path}")
+                continue
+                
+            try:
+                from .openclaw_client import OpenClawClient
+                import hashlib
+                client = OpenClawClient(base_url=self.base_url, api_key=self.api_key)
+                
+                # Construct instruction to force memory retention
+                prompt = f"[remember what's said, keep existing memory]\n\n{text}"
+                
+                # Determine user_id
+                user_id = uid
+                if not user_id:
+                    user_id = f"user_{hashlib.md5(path.encode()).hexdigest()[:8]}"
+                
+                response = client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self.model,
+                    user_id=user_id
+                )
+                results.append(f"Ingested via chat. Response: {str(response)[:50]}...")
+            except Exception as e:
+                logger.error(f"OpenClaw ingest failed for {path}: {e}")
+                results.append(f"Error: {e}")
+        return results

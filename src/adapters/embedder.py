@@ -333,3 +333,89 @@ class RandomEmbedder(EmbedderAdapter):
 
     def _random_vector(self) -> List[float]:
         return [self._rng.uniform(-1.0, 1.0) for _ in range(self._dimensions)]
+
+
+@dataclass
+class LocalHuggingFaceConfig:
+    """Configuration for local HuggingFace/SentenceTransformers models."""
+    model_name_or_path: str
+    dimensions: int = 1024
+    device: str = "cpu"
+    normalize_embeddings: bool = True
+    query_instruction: str = "" # e.g. "Represent this sentence for searching relevant passages: "
+    batch_size: int = 32
+
+class LocalHuggingFaceEmbedder(EmbedderAdapter):
+    """Adapter for local SentenceTransformers models (e.g. BGE)."""
+
+    def __init__(self, config: LocalHuggingFaceConfig) -> None:
+        self._config = config
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "Please install sentence-transformers to use LocalHuggingFaceEmbedder: "
+                "pip install sentence-transformers"
+            ) from exc
+
+        # Initialize model
+        # We assume this is called once per process or handled by Daft
+        import torch
+        device = config.device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+        self._model = SentenceTransformer(
+            config.model_name_or_path, 
+            device=device
+        )
+        
+        # Update dimensions from model if possible
+        if self._model.get_sentence_embedding_dimension():
+            self._dimensions = self._model.get_sentence_embedding_dimension()
+        else:
+            self._dimensions = config.dimensions
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    def embed_query(self, text: str) -> List[float]:
+        if not text:
+            return [0.0] * self._dimensions
+            
+        # Add instruction if present
+        query_text = text
+        if self._config.query_instruction:
+            query_text = f"{self._config.query_instruction}{text}"
+            
+        embedding = self._model.encode(
+            query_text,
+            normalize_embeddings=self._config.normalize_embeddings,
+            convert_to_numpy=True
+        )
+        return embedding.tolist()
+
+    def embed_passage(self, text: str) -> List[float]:
+        if not text:
+            return [0.0] * self._dimensions
+        
+        embedding = self._model.encode(
+            text,
+            normalize_embeddings=self._config.normalize_embeddings,
+            convert_to_numpy=True
+        )
+        return embedding.tolist()
+
+    def embed_passages(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        
+        embeddings = self._model.encode(
+            list(texts), 
+            batch_size=self._config.batch_size,
+            normalize_embeddings=self._config.normalize_embeddings,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+        return embeddings.tolist()

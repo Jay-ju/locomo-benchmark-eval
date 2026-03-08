@@ -38,6 +38,7 @@ from ..adapters.embedder import (
 from ..core.pipeline import ImportPipeline, PipelineConfig
 from ..core.search import SearchRunner
 from ..adapters.vector_store import create_vector_store
+from ..core.locomo_utils import load_locomo_data, parse_range_string
 
 app = typer.Typer(help="Import OpenClaw-style memories into configurable vector stores.")
 
@@ -76,6 +77,7 @@ def _create_search_runner(
     embed_base_url: Optional[str],
     embed_model: str,
     embed_api_key: Optional[str],
+    embed_provider: str = "openai",
     dry_run: bool,
     parallelism: int,
 ) -> tuple[SearchRunner, str]:
@@ -85,6 +87,14 @@ def _create_search_runner(
 
     if dry_run:
         embedder = RandomEmbedder(dimensions=vector_dim)
+    elif embed_provider == "local-huggingface":
+        from ..adapters.embedder import LocalHuggingFaceConfig, LocalHuggingFaceEmbedder
+        embed_cfg = LocalHuggingFaceConfig(
+            model_name_or_path=embed_model,
+            dimensions=vector_dim,
+            device="auto"
+        )
+        embedder = LocalHuggingFaceEmbedder(embed_cfg)
     else:
         embed_cfg = OpenAICompatibleConfig(
             model=embed_model,
@@ -128,11 +138,6 @@ def add(
         Path("./tmp_lancedb"),
         "--db-path",
         help="LanceDB directory path (for --store-type lancedb; will be created if not exists).",
-    ),
-    table_name: str = typer.Option(
-        "memories",
-        "--table-name",
-        help="Table / collection name in the target vector store (LanceDB: table name).",
     ),
     vector_dim: int = typer.Option(
         1024,
@@ -266,11 +271,6 @@ def ingest(
         "--db-path",
         help="LanceDB directory path (for --store-type lancedb; will be created if not exists).",
     ),
-    table_name: str = typer.Option(
-        "memories",
-        "--table-name",
-        help="Table / collection name in the target vector store (LanceDB: table name).",
-    ),
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
@@ -321,6 +321,12 @@ def ingest(
         envvar="EMBEDDING_API_KEY",
         help="Optional embedding API key (defaults to --api-key / OPENAI_API_KEY when omitted).",
     ),
+    embed_provider: str = typer.Option(
+        "openai",
+        "--embed-provider",
+        envvar="EMBEDDING_PROVIDER",
+        help="Embedding provider: 'openai', 'doubao', or 'local-huggingface' (BGE).",
+    ),
     max_tokens: int = typer.Option(
         2048,
         "--max-tokens",
@@ -336,6 +342,25 @@ def ingest(
         "--parallelism",
         help="Logical parallelism hint used by Daft and the embedding+insert loop.",
     ),
+    mode: str = typer.Option(
+        "agent",
+        "--mode",
+        help="Evaluation mode: 'agent' (OpenClaw API, default) or 'direct' (Internal RAG pipeline).",
+    ),
+    memory_type: str = typer.Option(
+        "lancedb",
+        "--memory-type",
+        help="Target memory system plugin (e.g. 'lancedb'). Defines extraction prompt and storage format for Direct Mode.",
+    ),
+    sample: Optional[str] = typer.Option(
+        None, "--sample", help="LoCoMo sample index or range (e.g. '0', '1-4')."
+    ),
+    sessions: Optional[str] = typer.Option(
+        None, "--sessions", help="LoCoMo session index or range (e.g. '1-4')."
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="Override user ID for LoCoMo ingestion."
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -345,10 +370,11 @@ def ingest(
         ),
     ),
 ) -> None:
-    """Ingest memories from session logs (session distillation).
+    """Ingest memories from raw text files using LLM distillation.
 
-    This command (formerly session-distill) uses an LLM to extract atomic memories from conversation logs
-    and stores them in the vector database.
+    Supports two modes via --mode:
+    - agent (Default): Send content to OpenClaw via Chat API to simulate memory formation.
+    - direct: Extract memories using internal RAG pipeline (ExtractionUDF -> LanceDB).
     """
 
     store_type_normalized = _normalize_store_type(store_type)
@@ -366,28 +392,91 @@ def ingest(
             temperature=temperature,
             parallelism=parallelism,
             dry_run=dry_run,
+            mode=mode,
+            memory_type=memory_type,
         )
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
 
     # 2) Execute distillation (each file -> multiple JSON memory entries).
-    entries = runner.run([str(p) for p in input_paths])
-    if not entries:
-        typer.echo("ingest: No memory entries obtained from input files, ending.")
-        raise typer.Exit(code=0)
+    is_locomo = False
+    if len(input_paths) == 1 and str(input_paths[0]).lower().endswith(".json"):
+        if sample or sessions or user or "locomo" in str(input_paths[0]).lower():
+            is_locomo = True
+
+    if is_locomo:
+        typer.echo(f"Detected LoCoMo dataset: {input_paths[0]}")
+        raw_data = load_locomo_data(
+            str(input_paths[0]),
+            mode="ingest",
+            sample_indices=parse_range_string(sample),
+            session_ranges=parse_range_string(sessions),
+            user_id_override=user,
+        )
+        if not raw_data:
+            typer.echo("ingest: No data loaded from LoCoMo file.")
+            raise typer.Exit(code=0)
+            
+        import daft
+        df = daft.from_pydict({
+            "text": [d["text"] for d in raw_data],
+            "path": [d["path"] for d in raw_data],
+            "user_id": [d["user_id"] for d in raw_data]
+        })
+        
+        processed_df = runner.run_dataframe(df, prompt_type="ingest", text_col="text", id_col="path")
+        collected = processed_df.collect().to_pydict()
+        
+        entries = []
+        is_agent = runner._is_agent_mode(runner.openai_base_url or "")
+        
+        if is_agent:
+             results = collected.get("ingest_result", [])
+             for r in results:
+                 entries.append({"agent_response": r})
+             
+             typer.echo(f"Agent Ingest completed: Processed {len(entries)} items via OpenClaw API.")
+             if entries:
+                 typer.echo(f"Sample response: {entries[0].get('agent_response', '')[:100]}...")
+             return
+        else:
+             entries_col = collected.get("entries", [])
+             for e in entries_col:
+                 if e: entries.extend(e)
+
+    else:
+        entries = runner.run([str(p) for p in input_paths])
+        if not entries:
+            typer.echo("ingest: No memory entries obtained from input files, ending.")
+            raise typer.Exit(code=0)
+
+        if mode == "agent":
+            typer.echo(f"Agent Ingest completed: Processed {len(entries)} items via OpenClaw API.")
+            if entries:
+                typer.echo(f"Sample response: {entries[0].get('agent_response', '')[:100]}...")
+            return
 
     # 3) Create vector store adapter.
     store = create_vector_store(
         store_type=store_type_normalized,
         db_path=str(db_path),
-        table_name=table_name,
+        table_name="memories",
         vector_dim=vector_dim,
     )
 
-    # 4) Create embedding adapter: dry-run uses RandomEmbedder, others use OpenAI-compatible Embeddings.
+    # 4) Create embedding adapter: dry-run uses RandomEmbedder, others use OpenAI-compatible or Local Embeddings.
     if dry_run:
         embedder = RandomEmbedder(dimensions=vector_dim)
+    elif embed_provider == "local-huggingface":
+        from ..adapters.embedder import LocalHuggingFaceConfig, LocalHuggingFaceEmbedder
+        # For local BGE/HF, use embed_model as model name/path
+        embed_cfg = LocalHuggingFaceConfig(
+            model_name_or_path=embed_model,
+            dimensions=vector_dim,
+            device="auto"
+        )
+        embedder = LocalHuggingFaceEmbedder(embed_cfg)
     else:
         effective_embed_base_url = embed_base_url or base_url
         effective_embed_api_key = embed_api_key or api_key
@@ -405,7 +494,7 @@ def ingest(
 
     if store_type_normalized == "lancedb":
         typer.echo(
-            f"Ingest completed: {inserted} memories imported into LanceDB at {db_path} (table={table_name}).",
+            f"Ingest completed: {inserted} memories imported into LanceDB at {db_path} (table='memories').",
         )
     else:
         typer.echo(
@@ -437,11 +526,6 @@ def search(
         "--db-path",
         help="LanceDB directory path (for --store-type lancedb; will be created if not exists).",
     ),
-    table_name: str = typer.Option(
-        "memories",
-        "--table-name",
-        help="Table / collection name in the target vector store (LanceDB: table name).",
-    ),
     vector_dim: int = typer.Option(
         1024,
         "--vector-dim",
@@ -465,6 +549,12 @@ def search(
         "--embed-api-key",
         envvar="EMBEDDING_API_KEY",
         help="Embedding API key. Can also come from EMBEDDING_API_KEY environment variable.",
+    ),
+    embed_provider: str = typer.Option(
+        "openai",
+        "--embed-provider",
+        envvar="EMBEDDING_PROVIDER",
+        help="Embedding provider: 'openai', 'doubao', or 'local-huggingface' (BGE).",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -524,11 +614,12 @@ def search(
     runner, store_type_normalized = _create_search_runner(
         store_type=store_type,
         db_path=db_path,
-        table_name=table_name,
+        table_name="memories",
         vector_dim=vector_dim,
         embed_base_url=embed_base_url,
         embed_model=embed_model,
         embed_api_key=embed_api_key,
+        embed_provider=embed_provider,
         dry_run=dry_run,
         parallelism=parallelism,
     )
@@ -676,9 +767,15 @@ def search_batch(
 
 
 @app.command("eval")
-def eval(
-    queries_file: Path = typer.Argument(
-        ..., help="Text file with one question per line (LoCoMo-style queries).",
+def eval_qa(
+    input_path: Path = typer.Argument(
+        ..., help="Input file containing questions (Text, JSONL, or LoCoMo JSON).",
+    ),
+    sample: Optional[str] = typer.Option(
+        None, "--sample", help="LoCoMo sample index or range (e.g. '0')."
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="Override user ID for QA evaluation."
     ),
     # Retrieval options
     store_type: str = typer.Option(
@@ -723,6 +820,12 @@ def eval(
         envvar="EMBEDDING_API_KEY",
         help="Embedding API key for retrieval embeddings.",
     ),
+    embed_provider: str = typer.Option(
+        "openai",
+        "--embed-provider",
+        envvar="EMBEDDING_PROVIDER",
+        help="Embedding provider: 'openai', 'doubao', or 'local-huggingface' (BGE).",
+    ),
     top_k: int = typer.Option(10, "--top-k", help="Maximum number of memories retrieved per question."),
     min_score: float = typer.Option(
         0.3,
@@ -763,6 +866,11 @@ def eval(
         "--parallelism",
         help="Logical parallelism hint used by Daft for per-question answering.",
     ),
+    mode: str = typer.Option(
+        "agent",
+        "--mode",
+        help="Evaluation mode: 'agent' (OpenClaw API, default) or 'direct' (Internal RAG pipeline).",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -791,16 +899,40 @@ def eval(
     """
 
     # Read questions
-    try:
-        text = queries_file.read_text(encoding="utf-8")
-    except Exception as exc:  # pragma: no cover - IO path
-        raise typer.BadParameter(f"Cannot read queries_file: {exc}") from exc
-
     questions: List[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            questions.append(line)
+    user_ids: List[Optional[str]] = []
+    
+    is_locomo = False
+    if str(input_path).lower().endswith(".json"):
+        if sample or user or "locomo" in str(input_path).lower():
+            is_locomo = True
+
+    if is_locomo:
+        typer.echo(f"Detected LoCoMo dataset: {input_path}")
+        raw_qa = load_locomo_data(
+             str(input_path),
+             mode="eval",
+             sample_indices=parse_range_string(sample),
+             user_id_override=user
+        )
+        if not raw_qa:
+            typer.echo("eval: No data loaded from LoCoMo file.")
+            raise typer.Exit(code=0)
+        
+        for item in raw_qa:
+            questions.append(item["question"])
+            user_ids.append(item.get("user_id"))
+    else:
+        try:
+            text = input_path.read_text(encoding="utf-8")
+        except Exception as exc:  # pragma: no cover - IO path
+            raise typer.BadParameter(f"Cannot read input_path: {exc}") from exc
+
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                questions.append(line)
+                user_ids.append(user)
 
     if not questions:
         typer.echo("eval: No valid question lines in input file.")
@@ -810,23 +942,29 @@ def eval(
     search_runner, store_type_normalized = _create_search_runner(
         store_type=store_type,
         db_path=db_path,
-        table_name=table_name,
+        table_name="memories",
         vector_dim=vector_dim,
         embed_base_url=embed_base_url,
         embed_model=embed_model,
         embed_api_key=embed_api_key,
+        embed_provider=embed_provider,
         dry_run=dry_run,
         parallelism=parallelism,
     )
 
     try:
-        search_results = search_runner.search_batch(questions, top_k=top_k, min_score=min_score)
+        search_results = search_runner.search_batch(
+            questions, 
+            top_k=top_k, 
+            min_score=min_score,
+            user_ids=user_ids
+        )
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
 
     qa_items: List[dict] = []
-    for q, results in zip(questions, search_results):
+    for q, results, uid in zip(questions, search_results, user_ids):
         # Assemble context text
         lines: List[str] = []
         context_ids: List[str] = []
@@ -848,6 +986,7 @@ def eval(
                 "question": q,
                 "context": context_text,
                 "context_ids": context_ids,
+                "user_id": uid,
             },
         )
 
@@ -865,6 +1004,7 @@ def eval(
             temperature=temperature,
             parallelism=parallelism,
             dry_run=dry_run,
+            mode=mode,
         )
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
