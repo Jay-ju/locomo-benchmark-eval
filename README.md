@@ -13,9 +13,33 @@
 
 - **Dual-Mode Evaluation**: Switch between Agent Mode (Default) and Direct Pipeline via `--mode agent` or `--mode direct`.
 - **LoCoMo Benchmark Support**: Built-in converter for LoCoMo dataset.
-- **Store Agnostic**: Defaults to **LanceDB**.
+- **Store Agnostic**: Defaults to **LanceDB**. Architecture supports adding adapters for Milvus, FAISS, etc.
 - **Pluggable Embedding**: Supports OpenAI-compatible providers.
 - **Distributed Processing**: Uses **Daft**.
+
+### Feature Matrix
+
+We are continuously expanding support for more backends.
+
+| Component | Implementation | Status | Note |
+| :--- | :--- | :--- | :--- |
+| **Vector Store** | **LanceDB** | ✅ Supported | Default backend |
+| | **Mem0** | 🚧 Planned | **Next Step** |
+| | Milvus | 🚧 Planned | Contributions welcome |
+| | FAISS | 🚧 Planned | Contributions welcome |
+| **Embedding** | OpenAI / Doubao | ✅ Supported | API |
+| | Local HuggingFace (BGE) | ✅ Supported | Local execution |
+| **Mode** | Agent Mode (OpenClaw) | ✅ Supported | End-to-end |
+| | Direct Mode (RAG Pipeline) | ✅ Supported | Component-level |
+
+### Vector Store Support
+
+Currently, only **LanceDB** is implemented out-of-the-box. To add support for other vector databases (e.g., Milvus, Elasticsearch), implement the `VectorStoreAdapter` interface in `src/adapters/vector_store.py`.
+
+**LanceDB Configuration**:
+*   `--store-type lancedb` (Default)
+*   `--db-path <path>`: Directory for LanceDB storage (Default: `./tmp_lancedb`).
+*   Table name is fixed to `memories`.
 
 ### Installation
 

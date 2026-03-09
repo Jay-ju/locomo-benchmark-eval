@@ -13,9 +13,33 @@
 
 - **双模式评估**：通过 `--mode agent` (默认) 或 `--mode direct` 切换。
 - **LoCoMo Benchmark 支持**：内置 LoCoMo 数据集转换器。
-- **存储无关性**：默认支持 **LanceDB**。
+- **存储无关性**：默认支持 **LanceDB**。代码结构支持扩展至 Milvus/FAISS/Viking 等其他向量库。
 - **可插拔 Embedding**：支持 OpenAI 兼容的提供商。
-- **分布式处理**：使用 **Daft**。
+- **分布式处理**: 使用 **Daft**。
+
+### 功能支持矩阵 (Feature Matrix)
+
+我们正在持续扩展对更多后端和组件的支持。
+
+| 组件类型 (Component) | 实现 (Implementation) | 状态 (Status) | 说明 (Note) |
+| :--- | :--- | :--- | :--- |
+| **Vector Store** | **LanceDB** | ✅ 已支持 | 默认后端 |
+| | **Mem0** | 🚧 计划中 | **Next Step** |
+| | Milvus | 🚧 计划中 | 欢迎社区贡献 |
+| | FAISS | 🚧 计划中 | 欢迎社区贡献 |
+| **Embedding** | OpenAI / Doubao | ✅ 已支持 | 通过 API 调用 |
+| | Local HuggingFace (BGE) | ✅ 已支持 | 本地运行 |
+| **Evaluation Mode** | Agent Mode (OpenClaw) | ✅ 已支持 | 端到端评估 |
+| | Direct Mode (RAG Pipeline) | ✅ 已支持 | 组件级评估 |
+
+### 向量存储支持
+
+目前工具仅内置了 **LanceDB** 的实现。如果您需要对接其他向量数据库（如 Milvus, Elasticsearch 等），可以参考 `src/adapters/vector_store.py` 中的 `VectorStoreAdapter` 接口进行扩展。
+
+**LanceDB 配置**:
+*   `--store-type lancedb` (默认)
+*   `--db-path <path>`: 指定 LanceDB 的存储目录 (默认为 `./tmp_lancedb`)。
+*   表名默认为 `memories`，暂不支持自定义。
 
 ### 安装
 
