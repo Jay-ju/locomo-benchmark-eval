@@ -59,6 +59,7 @@ class StoredMemoryEntry:
     scope: str
     importance: float
     timestamp: int
+    createdAt: int  # For compatibility with memory-lancedb (basic)
     metadata: str
 
     @classmethod
@@ -96,5 +97,6 @@ class StoredMemoryEntry:
             scope=payload.scope or "global",
             importance=float(importance),
             timestamp=int(ts),
+            createdAt=int(ts),
             metadata=metadata_str,
         )

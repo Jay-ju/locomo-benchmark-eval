@@ -20,6 +20,7 @@ command is available as a console script::
 import json
 import logging
 import os
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 
@@ -30,6 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from ..core.daft_runner import DaftPromptRunner
+from ..core.udfs import _openclaw_qa_async
 from ..adapters.embedder import (
     OpenAICompatibleConfig,
     OpenAICompatibleEmbedder,
@@ -342,6 +344,11 @@ def ingest(
         "--parallelism",
         help="Logical parallelism hint used by Daft and the embedding+insert loop.",
     ),
+    schema_mode: str = typer.Option(
+        "pro",
+        "--schema-mode",
+        help="LanceDB Schema mode: 'pro' (default, memory-lancedb-pro) or 'basic' (memory-lancedb).",
+    ),
     mode: str = typer.Option(
         "agent",
         "--mode",
@@ -425,6 +432,10 @@ def ingest(
             "user_id": [d["user_id"] for d in raw_data]
         })
         
+        # Repartition to enable parallel processing of UDFs
+        if parallelism > 1:
+            df = df.repartition(parallelism)
+        
         processed_df = runner.run_dataframe(df, prompt_type="ingest", text_col="text", id_col="path")
         collected = processed_df.collect().to_pydict()
         
@@ -463,10 +474,11 @@ def ingest(
         db_path=str(db_path),
         table_name="memories",
         vector_dim=vector_dim,
+        schema_mode=schema_mode,
     )
 
-    # 4) Create embedding adapter: dry-run uses RandomEmbedder, others use OpenAI-compatible or Local Embeddings.
-    if dry_run:
+    # 4) Create embedding adapter: dry-run uses RandomEmbedder unless Local BGE is requested.
+    if dry_run and embed_provider != "local-huggingface":
         embedder = RandomEmbedder(dimensions=vector_dim)
     elif embed_provider == "local-huggingface":
         from ..adapters.embedder import LocalHuggingFaceConfig, LocalHuggingFaceEmbedder
@@ -938,79 +950,126 @@ def eval_qa(
         typer.echo("eval: No valid question lines in input file.")
         raise typer.Exit(code=0)
 
-    # 1) Retrieval phase: Use SearchRunner + Daft (batch) to get context
-    search_runner, store_type_normalized = _create_search_runner(
-        store_type=store_type,
-        db_path=db_path,
-        table_name="memories",
-        vector_dim=vector_dim,
-        embed_base_url=embed_base_url,
-        embed_model=embed_model,
-        embed_api_key=embed_api_key,
-        embed_provider=embed_provider,
-        dry_run=dry_run,
-        parallelism=parallelism,
-    )
-
-    try:
-        search_results = search_runner.search_batch(
-            questions, 
-            top_k=top_k, 
-            min_score=min_score,
-            user_ids=user_ids
-        )
-    except RuntimeError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1)
-
     qa_items: List[dict] = []
-    for q, results, uid in zip(questions, search_results, user_ids):
-        # Assemble context text
-        lines: List[str] = []
-        context_ids: List[str] = []
-        for idx, r in enumerate(results):
-            mid = str(r.get("id", ""))
-            context_ids.append(mid)
-            cat = r.get("category", "other")
-            scope = r.get("scope", "global")
-            score = r.get("score", 0.0)
-            text_snippet = str(r.get("text", ""))
-            lines.append(
-                f"[{idx + 1}] (id={mid}, category={cat}, scope={scope}, score={score:.3f}) {text_snippet}"
-            )
 
-        context_text = "\n".join(lines)
-
-        qa_items.append(
-            {
+    if mode == "agent":
+        typer.echo("Eval mode: Agent (skipping local search, OpenClaw will retrieve internally)")
+        for q, uid in zip(questions, user_ids):
+            qa_items.append({
                 "question": q,
-                "context": context_text,
-                "context_ids": context_ids,
+                "context": "",
+                "context_ids": [],
                 "user_id": uid,
-            },
+            })
+    else:
+        # 1) Retrieval phase: Use SearchRunner + Daft (batch) to get context
+        search_runner, store_type_normalized = _create_search_runner(
+            store_type=store_type,
+            db_path=db_path,
+            table_name="memories",
+            vector_dim=vector_dim,
+            embed_base_url=embed_base_url,
+            embed_model=embed_model,
+            embed_api_key=embed_api_key,
+            embed_provider=embed_provider,
+            dry_run=dry_run,
+            parallelism=parallelism,
         )
+
+        try:
+            search_results = search_runner.search_batch(
+                questions, 
+                top_k=top_k, 
+                min_score=min_score,
+                user_ids=user_ids
+            )
+        except RuntimeError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1)
+
+        for q, results, uid in zip(questions, search_results, user_ids):
+            # Assemble context text
+            lines: List[str] = []
+            context_ids: List[str] = []
+            for idx, r in enumerate(results):
+                mid = str(r.get("id", ""))
+                context_ids.append(mid)
+                cat = r.get("category", "other")
+                scope = r.get("scope", "global")
+                score = r.get("score", 0.0)
+                text_snippet = str(r.get("text", ""))
+                lines.append(
+                    f"[{idx + 1}] (id={mid}, category={cat}, scope={scope}, score={score:.3f}) {text_snippet}"
+                )
+
+            context_text = "\n".join(lines)
+
+            qa_items.append(
+                {
+                    "question": q,
+                    "context": context_text,
+                    "context_ids": context_ids,
+                    "user_id": uid,
+                },
+            )
 
     # 2) Answering phase: DaftPromptRunner.answer_batch
     if not dry_run and not api_key:
         raise typer.BadParameter("eval requires --api-key or OPENAI_API_KEY in non-dry-run mode.")
 
-    try:
-        qa_runner = DaftPromptRunner(
-            prompt=QA_SYSTEM_PROMPT,
-            openai_base_url=base_url,
-            openai_api_key=api_key,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            parallelism=parallelism,
-            dry_run=dry_run,
-            mode=mode,
-        )
-    except RuntimeError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1)
+    if mode == "agent":
+        # Controlled Concurrency for Agent Mode
+        async def run_controlled():
+            import time
+            sem = asyncio.Semaphore(parallelism)
+            results = []
+            total = len(qa_items)
+            
+            async def process_item(idx, item):
+                async with sem:
+                    if idx % 10 == 0:
+                        typer.echo(f"[{idx+1}/{total}] Processing QA for {item['user_id']}...")
+                    
+                    try:
+                        ans = await _openclaw_qa_async(
+                            q=item["question"],
+                            user_id=item["user_id"],
+                            base_url=base_url,
+                            api_key=api_key,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens
+                        )
+                    except Exception as e:
+                        ans = f"Error: {e}"
+                    
+                    res = item.copy()
+                    res["answer"] = ans
+                    return res
 
-    qa_results = qa_runner.answer_batch(qa_items)
+            tasks = [process_item(i, item) for i, item in enumerate(qa_items)]
+            results = await asyncio.gather(*tasks)
+            return results
+            
+        qa_results = asyncio.run(run_controlled())
+    else:
+        try:
+            qa_runner = DaftPromptRunner(
+                prompt=QA_SYSTEM_PROMPT,
+                openai_base_url=base_url,
+                openai_api_key=api_key,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                parallelism=parallelism,
+                dry_run=dry_run,
+                mode=mode,
+            )
+        except RuntimeError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1)
+
+        qa_results = qa_runner.answer_batch(qa_items)
 
     json_str = json.dumps(qa_results, ensure_ascii=False, indent=2)
     if output is not None:

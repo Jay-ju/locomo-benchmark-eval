@@ -29,3 +29,10 @@ test_*.py
 data/locomo/*.jsonl
 data/evaluation/*.jsonl
 data/test_*
+
+# Ignore Vector DBs
+data/lancedb_*/
+lancedb/
+
+# Ignore temp results but maybe keep final?
+# results/ # Keeping results for now as requested

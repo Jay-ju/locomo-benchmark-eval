@@ -17,6 +17,20 @@
 - **Pluggable Embedding**: Supports OpenAI-compatible providers.
 - **Distributed Processing**: Uses **Daft**.
 
+### Key Advantages
+
+1.  **High-Performance Offline Ingestion**:
+    Bypasses the concurrency bottlenecks of the OpenClaw Gateway API by directly extracting and storing memories into the vector database (LanceDB). This approach drastically reduces ingestion time for the LoCoMo dataset from **~5 hours** (via API) to **~10 minutes** (local parallel extraction).
+
+2.  **Robust QA Evaluation**:
+    Built-in **concurrency control** (Semaphore) and **adaptive retry mechanisms** (Exponential Backoff) ensure stable evaluation even when the OpenClaw Gateway is under high load or unstable. This eliminates evaluation failures caused by transient 500 errors.
+
+3.  **Insightful Judging**:
+    The LLM-as-a-Judge module provides more than just a score—it generates detailed **reasoning** for every judgment and compiles a **failure report** classifying error types, helping developers quickly pinpoint system weaknesses.
+
+4.  **Fine-Grained Memory Extraction**:
+    Unlike standard approaches that embed entire sessions as single chunks (leading to noise and poor retrieval), this framework uses a customizable LLM-based extraction strategy (`ExtractionUDF`) to distill conversations into atomic, high-value facts. This significantly improves retrieval precision and reasoning capabilities.
+
 ### Feature Matrix
 
 We are continuously expanding support for more backends.
@@ -53,9 +67,9 @@ pip install -e .
 If you encounter network issues when downloading HuggingFace models, set proxy environment variables:
 
 ```bash
-export http_proxy=http://sys-proxy-rd-relay.byted.org:8118
-export https_proxy=http://sys-proxy-rd-relay.byted.org:8118
-export no_proxy=code.byted.org
+export http_proxy=http://your-proxy-host:port
+export https_proxy=http://your-proxy-host:port
+export no_proxy=localhost,127.0.0.1,your-internal-domain
 ```
 
 ### Quick Start
@@ -75,6 +89,11 @@ Create a `.env` file with your credentials:
 OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 OPENAI_API_KEY=your-volcengine-key
 OPENAI_MODEL=doubao-pro-32k
+
+# === Proxy ===
+http_proxy=http://your-proxy-host:port
+https_proxy=http://your-proxy-host:port
+no_proxy=localhost,127.0.0.1
 
 # === Embedding (Direct Mode Only) ===
 # Option 1: Doubao / OpenAI
@@ -192,3 +211,92 @@ python -m src.cli.main judge \
   "user_id": "user_123"  // Ensures QA is scoped to the correct user
 }
 ```
+
+### Agent Mode Evaluation (OpenClaw)
+
+This workflow evaluates a running OpenClaw instance using the LoCoMo benchmark.
+
+1.  **Configure Environment**:
+    Edit `.env` to include your API keys and Proxy settings:
+    ```bash
+    # Proxy
+    http_proxy=http://sys-proxy-rd-relay.byted.org:8118
+    https_proxy=http://sys-proxy-rd-relay.byted.org:8118
+    no_proxy=code.byted.org,localhost,127.0.0.1
+    
+    # Judge Configuration (Doubao)
+    OPENAI_API_KEY=your-key
+    OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3/
+    OPENAI_MODEL=doubao-seed-2-0-pro-260215
+    ```
+
+2.  **Run Evaluation (QA)**:
+    Executes 1986 questions against local OpenClaw service (`http://localhost:18789`).
+    
+    ```bash
+    ./scripts/eval_agent_openclaw.sh
+    ```
+    *   **Note**: The script uses `parallelism=10` to balance speed and server stability. It includes retry logic for transient errors.
+
+3.  **Run Judge**:
+    Scores the answers using LLM-as-a-Judge.
+    
+    ```bash
+    ./scripts/judge_openclaw.sh
+    ```
+
+4.  **View Statistics**:
+    Generates accuracy report.
+    
+    ```bash
+    python scripts/calc_score.py results/openclaw_eval_scored.json
+    ```
+
+### Project Structure
+
+```
+.
+├── data/               # Dataset storage (LoCoMo, LanceDB)
+├── results/            # Evaluation outputs
+├── scripts/            # Automation scripts (ingest, eval, judge)
+├── src/                # Source code
+│   ├── adapters/       # Vector Store & Embedding adapters
+│   ├── cli/            # CLI entry point (Typer)
+│   ├── core/           # Core logic (Pipeline, Search, Prompts)
+│   └── ...
+├── tests/              # Tests
+├── .env                # Environment configuration
+└── README.md           # Documentation
+```
+
+### CLI Options
+
+**`ingest` Command**
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `input_paths` | required | Input file(s) (JSON/TXT) |
+| `--store-type` | lancedb | Vector store backend |
+| `--db-path` | ./tmp_lancedb | Path to DB |
+| `--embed-provider` | openai | Embedding provider (openai/doubao/local-huggingface) |
+| `--parallelism` | 4 | Concurrency level |
+| `--schema-mode` | pro | Extraction schema (basic/pro) |
+
+**`eval` Command**
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `input_path` | required | Input QA file |
+| `--mode` | agent | Evaluation mode (`agent` or `direct`) |
+| `--base-url` | - | OpenClaw/LLM Base URL |
+| `--api-key` | - | API Key |
+| `--parallelism` | 4 | Concurrency level (10 recommended for OpenClaw) |
+| `--output` | stdout | Output JSON file path |
+
+**`judge` Command**
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `results_file` | required | Input JSON file with QA results |
+| `--output` | overwrite | Output JSON file with scores |
+| `--parallelism` | 4 | Concurrency level |

@@ -7,7 +7,7 @@ from pathlib import Path
 from .prompts.extraction import SESSION_EXTRACTION_PROMPT
 from .prompts.judge import JUDGE_SYSTEM_PROMPT, JUDGE_USER_TEMPLATE
 from .prompts.qa import QA_SYSTEM_PROMPT
-from .udfs import ExtractionUDF, JudgeUDF, QAUDF, SearchUDF, read_file_udf, OpenClawQAUDF, OpenClawIngestUDF
+from .udfs import make_judge_udf, make_qa_udf, SearchUDF, read_file_udf
 from ..adapters.embedder import EmbedderAdapter, OpenAICompatibleEmbedder, OpenAICompatibleConfig
 from .models import MemoryEntryPayload, StoredMemoryEntry
 from ..adapters.vector_store import VectorStoreAdapter
@@ -173,6 +173,10 @@ class DaftPromptRunner:
         # Detect mode
         is_openclaw = self._is_agent_mode(effective_base_url)
 
+        # Optimization: Repartition for parallelism if needed
+        if self.parallelism > 1:
+            df = df.repartition(self.parallelism)
+
         if prompt_type == "ingest":
             if is_openclaw:
                 # OpenClaw Ingest Mode
@@ -198,17 +202,24 @@ class DaftPromptRunner:
                 
                 user_id_expr = col("user_id") if "user_id" in df.column_names else daft.lit(None).cast(DataType.string())
 
+                from .udfs import make_extraction_udf
+                extract_memories = make_extraction_udf(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                    model=self.model,
+                    prompt=self.prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    dry_run=self.dry_run,
+                )
+
                 return df.with_column(
                     "entries",
-                    ExtractionUDF.with_init_args(
-                        api_key=effective_api_key,
-                        base_url=effective_base_url,
-                        model=self.model,
-                        prompt=self.prompt,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                        dry_run=self.dry_run,
-                    )(col(text_col), col(id_col) if id_col else daft.lit("unknown"), user_id_expr),
+                    extract_memories(
+                        col(text_col), 
+                        col(id_col) if id_col else daft.lit("unknown"), 
+                        user_id_expr
+                    ),
                 )
 
         elif prompt_type == "qa":
@@ -231,17 +242,20 @@ class DaftPromptRunner:
                 if "context" not in df.column_names:
                     df = df.with_column("context", daft.lit(""))
                 
+                from .udfs import make_qa_udf
+                qa_udf = make_qa_udf(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                    model=self.model,
+                    prompt=self.prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    dry_run=self.dry_run,
+                )
+
                 return df.with_column(
                     "answer",
-                    QAUDF.with_init_args(
-                        api_key=effective_api_key,
-                        base_url=effective_base_url,
-                        model=self.model,
-                        prompt=self.prompt,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                        dry_run=self.dry_run,
-                    )(col(text_col), col("context")),
+                    qa_udf(col(text_col), col("context")),
                 )
         
         else:
@@ -328,7 +342,8 @@ class DaftPromptRunner:
                     exc,
                 )
 
-        batch_size = max(1, int(self.parallelism) * 4)
+        # Use large batch size for efficient writing
+        batch_size = 2048
         total_inserted = 0
 
         for i in range(0, len(payloads), batch_size):
@@ -359,7 +374,8 @@ class DaftPromptRunner:
     ) -> int:
         """Embed payloads in parallel using Daft UDF, then insert."""
         
-        batch_size = max(1, int(self.parallelism) * 4)
+        # Use large batch size
+        batch_size = 2048
         
         # 1. Group payloads into batches to process in UDF
         batches = []
@@ -455,29 +471,33 @@ class DaftPromptRunner:
 
         if is_openclaw:
             logger.info("Using OpenClawQAUDF for QA generation")
+            from .udfs import make_openclaw_qa_udf
+            openclaw_qa = make_openclaw_qa_udf(
+                api_key=effective_api_key,
+                base_url=effective_base_url,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                dry_run=self.dry_run,
+            )
             df = df.with_column(
                 "answer",
-                OpenClawQAUDF.with_init_args(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    dry_run=self.dry_run,
-                )(col("question"), col("user_id")),
+                openclaw_qa(col("question"), col("user_id")),
             )
         else:
+            from .udfs import make_qa_udf
+            qa_udf = make_qa_udf(
+                api_key=effective_api_key,
+                base_url=effective_base_url,
+                model=self.model,
+                prompt=self.prompt,  # This will be the QA system prompt
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                dry_run=self.dry_run,
+            )
             df = df.with_column(
                 "answer",
-                QAUDF.with_init_args(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                    model=self.model,
-                    prompt=self.prompt,  # This will be the QA system prompt
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    dry_run=self.dry_run,
-                )(col("question"), col("context")),
+                qa_udf(col("question"), col("context")),
             )
 
         collected = df.collect().to_pydict()
@@ -517,20 +537,25 @@ class DaftPromptRunner:
             "original_item": qa_results
         })
 
-        # Use JudgeUDF (Class UDF)
-        effective_api_key = self._resolve_llm_api_key()
-        effective_base_url = self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+        # Use JudgeUDF (Function UDF)
+        # Prioritize JUDGE_ specific env vars, then fallback to standard
+        effective_api_key = os.getenv("JUDGE_API_KEY") or self._resolve_llm_api_key()
+        effective_base_url = os.getenv("JUDGE_BASE_URL") or self.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+        effective_model = os.getenv("JUDGE_MODEL") or self.model
+
+        from .udfs import make_judge_udf
+        judge_udf = make_judge_udf(
+            api_key=effective_api_key,
+            base_url=effective_base_url,
+            model=effective_model,
+            system_prompt=JUDGE_SYSTEM_PROMPT,
+            user_template=JUDGE_USER_TEMPLATE,
+            dry_run=self.dry_run,
+        )
 
         df = df.with_column(
             "judge_result",
-            JudgeUDF.with_init_args(
-                api_key=effective_api_key,
-                base_url=effective_base_url,
-                model=self.model,
-                system_prompt=JUDGE_SYSTEM_PROMPT,
-                user_template=JUDGE_USER_TEMPLATE,
-                dry_run=self.dry_run,
-            )(col("question"), col("answer"), col("ground_truth")),
+            judge_udf(col("question"), col("answer"), col("ground_truth")),
         )
 
         collected = df.collect().to_pydict()

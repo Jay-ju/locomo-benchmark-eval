@@ -271,7 +271,24 @@ class OpenAICompatibleEmbedder(EmbedderAdapter):
                 if self._client is None:
                      # Deterministic pseudo-random vectors for reproducible tests.
                     return [self._random_vector() for _ in texts_list]
-                response = self._client.embeddings.create(**payload)  # type: ignore[operator]
+                
+                # Chunk inputs to respect provider limits (Doubao: 256, OpenAI: 2048)
+                chunk_size = 200
+                all_data = []
+                
+                for i in range(0, len(texts_list), chunk_size):
+                    chunk = texts_list[i : i + chunk_size]
+                    chunk_payload = payload.copy()
+                    chunk_payload["input"] = chunk
+                    
+                    response = self._client.embeddings.create(**chunk_payload)  # type: ignore[operator]
+                    all_data.extend(getattr(response, "data", []))
+                
+                # Wrap in a simple structure to match the loop below
+                class UnifiedResponse:
+                    def __init__(self, data):
+                        self.data = data
+                response = UnifiedResponse(all_data)
         except Exception as exc:  # pragma: no cover - network path
             logger.error("Failed to call embedding provider: %s", exc)
             raise

@@ -78,21 +78,15 @@ class LanceDBConfig:
     db_path: str
     table_name: str = "memories"
     vector_dim: int = 1024
+    schema_mode: str = "pro"  # "basic" or "pro"
 
 
 class LanceDBVectorStore(VectorStoreAdapter):
     """Simple LanceDB-backed implementation of :class:`VectorStoreAdapter`.
 
-    The table schema is aligned with ``memory-lancedb-pro``:
-
-    - id: string (UUID)
-    - text: string
-    - vector: float[]
-    - category: string
-    - scope: string
-    - importance: float
-    - timestamp: int64 (ms)
-    - metadata: string (JSON)
+    Supports two schema modes:
+    - "pro" (default): memory-lancedb-pro compatible (timestamp, scope, metadata)
+    - "basic": memory-lancedb compatible (createdAt, no scope/metadata)
     """
 
     def __init__(self, config: LanceDBConfig) -> None:
@@ -120,25 +114,29 @@ class LanceDBVectorStore(VectorStoreAdapter):
             table = db.open_table(table_name)
             logger.info("Opened existing LanceDB table '%s' at %s", table_name, db_path)
         except Exception:  # pragma: no cover - table creation path
-            # Create a schema entry row similar to memory-lancedb-pro so
-            # that the Lance schema is fully specified from the start.
+            # Create a schema entry row so that the Lance schema is fully specified.
             schema_entry = {
                 "id": "__schema__",
                 "text": "",
                 "vector": [0.0] * self.config.vector_dim,
                 "category": "other",
-                "scope": "global",
                 "importance": 0.0,
-                "timestamp": 0,
-                "metadata": "{}",
             }
+            
+            if self.config.schema_mode == "basic":
+                schema_entry["createdAt"] = 0
+            else:
+                schema_entry["timestamp"] = 0
+                schema_entry["scope"] = "global"
+                schema_entry["metadata"] = "{}"
+
             table = db.create_table(table_name, [schema_entry])
             try:
                 table.delete(where="id = '__schema__'")
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Failed to delete schema marker row: %s", exc)
 
-            logger.info("Created new LanceDB table '%s' at %s", table_name, db_path)
+            logger.info("Created new LanceDB table '%s' at %s (Mode: %s)", table_name, db_path, self.config.schema_mode)
 
         self._db = db
         self._table = table
@@ -153,28 +151,33 @@ class LanceDBVectorStore(VectorStoreAdapter):
 
         self._ensure_table()
 
-        # Vector dimension check at the adapter boundary. This protects us
-        # from accidentally mixing tables created with different embedding
-        # models.
+        # Vector dimension check
         for e in entries:
             if len(e.vector) != self.config.vector_dim:
                 raise ValueError(
                     f"Vector dimension mismatch: expected {self.config.vector_dim}, got {len(e.vector)}",
                 )
 
-        records: List[dict] = [
-            {
+        records: List[dict] = []
+        for e in entries:
+            item = {
                 "id": e.id,
                 "text": e.text,
                 "vector": e.vector,
                 "category": e.category,
-                "scope": e.scope,
                 "importance": float(e.importance),
-                "timestamp": int(e.timestamp),
-                "metadata": e.metadata,
             }
-            for e in entries
-        ]
+            
+            if self.config.schema_mode == "basic":
+                # Basic schema: createdAt
+                item["createdAt"] = int(e.timestamp)
+            else:
+                # Pro schema: timestamp, scope, metadata
+                item["timestamp"] = int(e.timestamp)
+                item["scope"] = e.scope
+                item["metadata"] = e.metadata
+            
+            records.append(item)
 
         assert self._table is not None  # for type checkers
         self._table.add(records)
@@ -405,10 +408,13 @@ def create_vector_store(store_type: str, **kwargs: object) -> VectorStoreAdapter
         if not isinstance(vector_dim_obj, int):
             raise ValueError("vector_dim must be an int for LanceDB vector store")
 
+        schema_mode = kwargs.get("schema_mode", "pro")
+
         cfg = LanceDBConfig(
             db_path=db_path_obj,
             table_name=table_name_obj,
             vector_dim=vector_dim_obj,
+            schema_mode=schema_mode,
         )
         return LanceDBVectorStore(cfg)
 
