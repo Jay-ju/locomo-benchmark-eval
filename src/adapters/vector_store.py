@@ -103,6 +103,7 @@ class LanceDBVectorStore(VectorStoreAdapter):
             return
 
         import lancedb  # type: ignore
+        import pyarrow as pa
 
         db_path = os.path.expanduser(self.config.db_path)
         Path(db_path).mkdir(parents=True, exist_ok=True)
@@ -113,29 +114,30 @@ class LanceDBVectorStore(VectorStoreAdapter):
         try:
             table = db.open_table(table_name)
             logger.info("Opened existing LanceDB table '%s' at %s", table_name, db_path)
-        except Exception:  # pragma: no cover - table creation path
-            # Create a schema entry row so that the Lance schema is fully specified.
-            schema_entry = {
-                "id": "__schema__",
-                "text": "",
-                "vector": [0.0] * self.config.vector_dim,
-                "category": "other",
-                "importance": 0.0,
-            }
+        except Exception:
+            # Create table with explicit PyArrow schema to avoid inference issues
+            dim = self.config.vector_dim
+            
+            # Base schema
+            fields = [
+                pa.field("id", pa.string()),
+                pa.field("text", pa.string()),
+                # Use FixedSizeList for vector
+                pa.field("vector", pa.list_(pa.float32(), dim)),
+                pa.field("category", pa.string()),
+                pa.field("importance", pa.float64()),
+            ]
             
             if self.config.schema_mode == "basic":
-                schema_entry["createdAt"] = 0
+                fields.append(pa.field("createdAt", pa.int64()))
             else:
-                schema_entry["timestamp"] = 0
-                schema_entry["scope"] = "global"
-                schema_entry["metadata"] = "{}"
+                fields.append(pa.field("timestamp", pa.int64()))
+                fields.append(pa.field("scope", pa.string()))
+                fields.append(pa.field("metadata", pa.string()))
+                
+            schema = pa.schema(fields)
 
-            table = db.create_table(table_name, [schema_entry])
-            try:
-                table.delete(where="id = '__schema__'")
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Failed to delete schema marker row: %s", exc)
-
+            table = db.create_table(table_name, schema=schema)
             logger.info("Created new LanceDB table '%s' at %s (Mode: %s)", table_name, db_path, self.config.schema_mode)
 
         self._db = db

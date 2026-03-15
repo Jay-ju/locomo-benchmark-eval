@@ -382,16 +382,53 @@ class LocalHuggingFaceEmbedder(EmbedderAdapter):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
             
-        self._model = SentenceTransformer(
-            config.model_name_or_path, 
-            device=device
-        )
+        self._is_gguf = str(config.model_name_or_path).lower().endswith(".gguf")
         
-        # Update dimensions from model if possible
-        if self._model.get_sentence_embedding_dimension():
-            self._dimensions = self._model.get_sentence_embedding_dimension()
-        else:
+        if self._is_gguf:
+            try:
+                from llama_cpp import Llama
+            except ImportError as e:
+                raise ImportError(
+                    "You are trying to use a GGUF model but `llama-cpp-python` is not installed.\n"
+                    "Please install it: `pip install llama-cpp-python`"
+                ) from e
+            
+            n_gpu_layers = -1 if device == "cuda" else 0
+            logger.info(f"Loading GGUF model: {config.model_name_or_path} (n_gpu_layers={n_gpu_layers})")
+            
+            self._model = Llama(
+                model_path=config.model_name_or_path,
+                embedding=True,
+                n_gpu_layers=n_gpu_layers,
+                verbose=False
+            )
             self._dimensions = config.dimensions
+        else:
+            try:
+                self._model = SentenceTransformer(
+                    config.model_name_or_path, 
+                    device=device
+                )
+            except Exception as exc:
+                msg = str(exc)
+                # Handle Network errors by retrying in offline mode
+                if "Network is unreachable" in msg or "Connection refused" in msg or "offline" in msg or "Errno 101" in msg:
+                    logger.warning(f"Network error during model load: {exc}. Retrying with HF_HUB_OFFLINE=1 (Offline Mode).")
+                    import os
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    try:
+                        self._model = SentenceTransformer(config.model_name_or_path, device=device)
+                    except Exception as e2:
+                        # If still fails, re-raise original or new
+                        raise e2
+                else:
+                    raise exc
+            
+            # Update dimensions from model if possible
+            if self._model.get_sentence_embedding_dimension():
+                self._dimensions = self._model.get_sentence_embedding_dimension()
+            else:
+                self._dimensions = config.dimensions
 
     @property
     def dimensions(self) -> int:
@@ -401,7 +438,18 @@ class LocalHuggingFaceEmbedder(EmbedderAdapter):
         if not text:
             return [0.0] * self._dimensions
             
-        # Add instruction if present
+        if self._is_gguf:
+            # GGUF model
+            query_text = text
+            if self._config.query_instruction:
+                query_text = f"{self._config.query_instruction}{text}"
+            
+            # Llama.create_embedding returns dict with 'data' list
+            resp = self._model.create_embedding(query_text)
+            embedding = resp['data'][0]['embedding']
+            return embedding
+        
+        # Standard SentenceTransformer
         query_text = text
         if self._config.query_instruction:
             query_text = f"{self._config.query_instruction}{text}"
@@ -417,6 +465,10 @@ class LocalHuggingFaceEmbedder(EmbedderAdapter):
         if not text:
             return [0.0] * self._dimensions
         
+        if self._is_gguf:
+            resp = self._model.create_embedding(text)
+            return resp['data'][0]['embedding']
+        
         embedding = self._model.encode(
             text,
             normalize_embeddings=self._config.normalize_embeddings,
@@ -427,6 +479,15 @@ class LocalHuggingFaceEmbedder(EmbedderAdapter):
     def embed_passages(self, texts: Sequence[str]) -> List[List[float]]:
         if not texts:
             return []
+        
+        if self._is_gguf:
+            # LlamaCpp doesn't support batch embedding natively in one call like ST
+            # We loop manually
+            results = []
+            for t in texts:
+                resp = self._model.create_embedding(t)
+                results.append(resp['data'][0]['embedding'])
+            return results
         
         embeddings = self._model.encode(
             list(texts), 

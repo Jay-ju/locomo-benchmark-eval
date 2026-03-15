@@ -36,3 +36,9 @@ lancedb/
 
 # Ignore temp results but maybe keep final?
 # results/ # Keeping results for now as requested
+
+# Temp ingestion logs
+ingest_*.txt
+
+# Local models
+data/models/

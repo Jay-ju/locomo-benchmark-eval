@@ -345,9 +345,9 @@ def ingest(
         help="Logical parallelism hint used by Daft and the embedding+insert loop.",
     ),
     schema_mode: str = typer.Option(
-        "pro",
+        "basic",
         "--schema-mode",
-        help="LanceDB Schema mode: 'pro' (default, memory-lancedb-pro) or 'basic' (memory-lancedb).",
+        help="LanceDB Schema mode: 'basic' (default, memory-lancedb) or 'pro' (memory-lancedb-pro).",
     ),
     mode: str = typer.Option(
         "agent",
